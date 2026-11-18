@@ -290,6 +290,15 @@ class FriendEditionTest(unittest.TestCase):
                 info=z.getinfo('随身开发/开始使用.command');self.assertTrue((info.external_attr>>16)&0o100)
             with self.assertRaises(Blocked):pf.package(out)
 
+    def test_common_word_username_does_not_block_the_build(self):
+        from unittest.mock import patch
+        from portable import distribution
+        with patch('getpass.getuser',return_value='runner'):
+            words=distribution.personal_markers()
+            self.assertNotIn('runner',words);self.assertIn('/runner/',words);self.assertIn('runner@',words)
+            with tempfile.TemporaryDirectory() as d:
+                distribution.build(SOURCE,Path(d).resolve()/'随身开发','friend')
+
     def test_short_latin_marker_matches_whole_word_only(self):
         from portable.distribution import personal_hits
         with tempfile.TemporaryDirectory() as d:

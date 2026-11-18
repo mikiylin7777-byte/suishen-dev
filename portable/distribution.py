@@ -109,13 +109,14 @@ def build(source,target,edition='full',markers=()):
         if candidate.exists():shutil.rmtree(candidate)
 
 def personal_markers(extra=(),local=True):
-    """打包人的个人信息：家目录路径、用户名（local=False 时不加，CI 机器的用户名不算），再加上调用方给的词（名字、项目名、内网地址等）。"""
+    """打包人的个人信息：家目录路径、路径和邮箱里的用户名（local=False 时不加，CI 机器的用户名不算），再加上调用方给的词（名字、项目名、内网地址等）。
+    用户名不单独整词比对：像 runner 这种用户名本身是代码里的普通单词，会把整个程序误判成个人信息（见 DECISIONS 2026-11-18）。"""
     import getpass
     found=[]
     if local:
         found.append(str(Path.home()))
         user=getpass.getuser()
-        if len(user)>=3:found.append(user)
+        if len(user)>=3:found+=['/'+user+'/',user+'@']
     return [m for m in dict.fromkeys([*found,*extra]) if m and m.strip()]
 
 def personal_hits(root,markers=(),local=True):
