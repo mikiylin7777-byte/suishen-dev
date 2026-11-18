@@ -18,7 +18,7 @@ The user interface and documentation are currently in Chinese.
 ## Install
 Requirements: macOS, Python 3.9+.
 
-1. Download the latest `随身开发-对外版-<version>.zip` from [Releases](https://github.com/mikiylin7777-byte/suishen-dev/releases) and verify its SHA256.
+1. Download the latest `suishen-dev-<version>.zip` from [Releases](https://github.com/mikiylin7777-byte/suishen-dev/releases) and verify its SHA256.
 2. Unzip and move the `随身开发` folder into your home folder.
 3. Double-click `开始使用.command` and answer a few setup questions.
 

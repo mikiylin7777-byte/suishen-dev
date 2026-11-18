@@ -20,7 +20,7 @@
 ## 安装
 **系统要求**：macOS，Python 3.9 或更新（系统自带的就行）。
 
-1. 到 [Releases](https://github.com/mikiylin7777-byte/suishen-dev/releases) 下载最新的 `随身开发-对外版-<版本>.zip`，核对页面上的 SHA256；
+1. 到 [Releases](https://github.com/mikiylin7777-byte/suishen-dev/releases) 下载最新的 `suishen-dev-<版本>.zip`，核对页面上的 SHA256；
 2. 解压，把 `随身开发` 文件夹放到你的个人文件夹（不要放在「下载」或桌面）；
 3. 双击 `开始使用.command`，按提示回答几个问题（怎么称呼你、项目放哪、代码只存本机还是也推到网上）。
 
