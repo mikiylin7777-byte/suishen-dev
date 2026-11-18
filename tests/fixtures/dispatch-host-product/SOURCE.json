@@ -1,0 +1,15 @@
+{
+  "source": "dispatch fixed candidate product sources; exact committed bytes pinned",
+  "source_commit": "1117e8963adaf9edbf10c281a04d7f1bced03baf",
+  "source_directory": "/home/demo/dispatch-hub-worktrees/taskline-handoff-20261106/bin",
+  "files": [
+    {
+      "path": "taskline_handoff.py",
+      "sha256": "7f705394a8f6c3a544f920b1e5a5fc8df6ca5cf5709951cfcb278bd0a8f9ddcc"
+    },
+    {
+      "path": "taskline_inventory.py",
+      "sha256": "1e1fac778849b4c1d58a24339b6aba6fba716243a7f242b6bff1815a964d03fd"
+    }
+  ]
+}

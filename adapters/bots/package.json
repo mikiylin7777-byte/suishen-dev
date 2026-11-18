@@ -1,0 +1,1 @@
+{"name":"portable-development-bots","version":"0.1.0","private":true,"type":"module","scripts":{"test":"node --test test.mjs"},"dependencies":{"@larksuiteoapi/node-sdk":"1.76.0","@wecom/aibot-node-sdk":"1.0.6"}}

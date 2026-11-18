@@ -1,0 +1,10 @@
+# gitleaks 配置：沿用默认规则，只放行已确认的误报（2026-10-29 逐条核对，只看值的形状）。
+[extend]
+useDefault = true
+
+[allowlist]
+description = "测试夹具里的假密钥，以及发行清单里「文件名: sha256」形式的文件指纹"
+paths = [
+  '''^tests/''',
+  '''^docs/历史/integration-evidence/[^/]*release\.json$''',
+]

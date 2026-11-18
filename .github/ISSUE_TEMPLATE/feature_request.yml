@@ -1,0 +1,22 @@
+name: 功能建议
+description: 想要随身开发多做点什么
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 现在哪里不方便
+      description: 用大白话说你遇到的情况
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: 希望变成什么样
+      description: 做到什么样算好
+    validations:
+      required: true
+  - type: textarea
+    id: other
+    attributes:
+      label: 其他补充

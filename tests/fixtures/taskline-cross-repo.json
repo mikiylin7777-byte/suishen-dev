@@ -1,0 +1,129 @@
+{
+  "validation": "SIMULATED_ONLY_NO_REAL_T3",
+  "request": {
+    "manifest": {
+      "manifest_id": "synthetic-window-handoff",
+      "version": 1,
+      "source_thread": {
+        "thread_id": "mcp:launch:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "link": "<t3-thread://v2/11111111-2222-4333-8444-555555555555/mcp:launch:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>"
+      },
+      "target_thread": {
+        "thread_id": "mcp:bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+        "link": "<t3-thread://v2/11111111-2222-4333-8444-555555555555/mcp:bbbbbbbb-cccc-4ddd-8eee-ffffffffffff>"
+      },
+      "bindings": [
+        {
+          "handoff_id": "synthetic-handoff-1",
+          "version": 1,
+          "source_thread": {
+            "thread_id": "mcp:launch:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "link": "<t3-thread://v2/11111111-2222-4333-8444-555555555555/mcp:launch:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>"
+          },
+          "target_thread": {
+            "thread_id": "mcp:bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+            "link": "<t3-thread://v2/11111111-2222-4333-8444-555555555555/mcp:bbbbbbbb-cccc-4ddd-8eee-ffffffffffff>"
+          },
+          "task_id": "task-synthetic-1",
+          "run_id": "20261106-000001-synthetic",
+          "context_sha256": "83676e8bb81199a73e4854ae7179ba8fe15eeee17086eaf3bc36c273638d363b"
+        },
+        {
+          "handoff_id": "synthetic-handoff-2",
+          "version": 1,
+          "source_thread": {
+            "thread_id": "mcp:launch:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "link": "<t3-thread://v2/11111111-2222-4333-8444-555555555555/mcp:launch:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>"
+          },
+          "target_thread": {
+            "thread_id": "mcp:bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+            "link": "<t3-thread://v2/11111111-2222-4333-8444-555555555555/mcp:bbbbbbbb-cccc-4ddd-8eee-ffffffffffff>"
+          },
+          "task_id": "task-synthetic-2",
+          "run_id": "20261106-000002-synthetic",
+          "context_sha256": "c46e3c8d39f024f9730909ff3ed5905a244d10676e7673bfc8ddde7985b32108"
+        }
+      ]
+    },
+    "member_metadata": {
+      "synthetic-handoff-1": {
+        "context_ref": {
+          "ref": "fixture:synthetic-handoff-1:context",
+          "sha256": "83676e8bb81199a73e4854ae7179ba8fe15eeee17086eaf3bc36c273638d363b"
+        },
+        "authorization_ref": {
+          "ref": "fixture:authorization",
+          "sha256": "9fd5e341667b87936e7c6d75fdc3bd8a75d8bc17944f33229382c5d58fb9f58e"
+        },
+        "current_caller": "codex:synthetic-successor",
+        "scope": "engineering",
+        "worker_active": true,
+        "todos": [
+          "接回原任务结果"
+        ]
+      },
+      "synthetic-handoff-2": {
+        "context_ref": {
+          "ref": "fixture:synthetic-handoff-2:context",
+          "sha256": "c46e3c8d39f024f9730909ff3ed5905a244d10676e7673bfc8ddde7985b32108"
+        },
+        "authorization_ref": {
+          "ref": "fixture:authorization",
+          "sha256": "9fd5e341667b87936e7c6d75fdc3bd8a75d8bc17944f33229382c5d58fb9f58e"
+        },
+        "current_caller": "codex:synthetic-successor",
+        "scope": "engineering",
+        "worker_active": true,
+        "todos": [
+          "接回原任务结果"
+        ]
+      }
+    }
+  },
+  "contexts": {
+    "synthetic-handoff-1": {
+      "goal": "合成续接验收，无真实业务操作",
+      "task": 1,
+      "remaining": [
+        "接回原任务结果",
+        "核实成品"
+      ],
+      "authorization": "SIMULATED_ONLY"
+    },
+    "synthetic-handoff-2": {
+      "goal": "合成续接验收，无真实业务操作",
+      "task": 2,
+      "remaining": [
+        "接回原任务结果",
+        "核实成品"
+      ],
+      "authorization": "SIMULATED_ONLY"
+    }
+  },
+  "title_vectors": [
+    {
+      "title": "合成旧窗口 🧪",
+      "purpose": "preserve unicode original title"
+    },
+    {
+      "title": "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中🧪",
+      "utf16_units": 512,
+      "purpose": "bare title at API boundary; carrier suffix must cause explicit capacity block"
+    },
+    {
+      "title": "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中🧪",
+      "utf16_units": 513,
+      "purpose": "reject oversized title before API call"
+    }
+  ],
+  "required_scenarios": [
+    "only_one_of_two_ready_must_not_archive",
+    "both_ready_archive_once",
+    "manifest_version_change_invalidates_receipts",
+    "late_result_after_archive_reaches_same_target",
+    "accepted_delivery_without_consumption_is_not_ready",
+    "unknown_archive_result_read_before_retry",
+    "source_active_or_pending_blocks",
+    "target_failed_blocks"
+  ]
+}

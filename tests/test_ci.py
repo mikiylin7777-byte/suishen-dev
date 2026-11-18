@@ -1,0 +1,280 @@
+import json
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from portable.core import Blocked, Store
+from portable import ci
+
+
+class FakeApi:
+    def __init__(self,pr,statuses,platform='gitea'):
+        self.pr=pr;self.statuses=statuses;self.calls=[];self.platform=platform;self.commit_time='2026-11-14T00:00:00+08:00';self.tasks=None;self.files=[{'filename':'src/a.py','status':'changed'}];self.branches=set();self.branch_error=404
+    def __call__(self,idn,method,path,payload=None):
+        self.calls.append((method,path))
+        if '/pulls/' in path and method=='GET' and '/files' not in path:return self.pr() if callable(self.pr) else self.pr
+        if path.endswith('/status'):
+            v=self.statuses() if callable(self.statuses) else self.statuses
+            return {'state':'success','statuses':v}
+        if 'check-runs' in path:return {'check_runs':[]}
+        if '/actions/tasks' in path and self.tasks is not None:return {'workflow_runs':self.tasks}
+        if '/contents/tools/ci/docs_only.py' in path:
+            from portable.remote_publish import DeliveryError
+            if getattr(self,'docs_gate',False):return {'name':'docs_only.py'}
+            raise DeliveryError('rejected','404',404)
+        if '/branches/' in path:
+            from portable.remote_publish import DeliveryError
+            if path.rsplit('/',1)[1] in self.branches:return {'name':path.rsplit('/',1)[1]}
+            raise DeliveryError('rejected','404',self.branch_error)
+        if '/files' in path:return self.files[(int(path.rsplit('page=',1)[1])-1)*50:int(path.rsplit('page=',1)[1])*50]
+        if '/git/commits/' in path:return {'created':self.commit_time,'commit':{'committer':{'date':self.commit_time}}}
+        raise AssertionError(path)
+
+
+def pr(state='open',merged=False,mergeable=True,sha='abc123',base='main',at='2026-11-14T00:00:00+08:00'):
+    return {'state':state,'merged':merged,'mergeable':mergeable,'head':{'sha':sha},'base':{'ref':base},'html_url':'http://x/pr/1','created_at':at,'updated_at':at}
+
+
+def st(*states):
+    return [{'context':f'CI / job{i}','status':s,'description':s,'target_url':f'/r/actions/runs/{i}'} for i,s in enumerate(states)]
+
+T0=1794585600.0  # 2026-11-14 00:00 +08:00
+def at(minutes):return lambda:T0+minutes*60
+
+
+class CiTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.t=Path(self.tmp.name).resolve();self.s=Store(self.t/'root')
+        self.repo=self.t/'repo';self.repo.mkdir()
+        subprocess.run(['git','init','-q',str(self.repo)],check=True)
+        subprocess.run(['git','-C',str(self.repo),'remote','add','origin','http://127.0.0.1:3000/test/demo.git'],check=True)
+        from portable import board
+        board.apply(self.s,[{'id':'demo','name':'演示','path':str(self.repo),'status_path':str(self.repo/'STATUS.md')}])
+    def tearDown(self):self.s.db.close();self.tmp.cleanup()
+
+    def test_manual_runs_are_not_counted(self):
+        # 审核 11-14：手动运行分不清同一轮、全部任务，会把不同工作流、不同轮次拼成「通过」，所以不认
+        skipped=[{'context':'CI / checks (pull_request)','status':'skipped','description':'','target_url':''}]
+        api=FakeApi(pr(base='development'),skipped)
+        api.tasks=[{'id':2,'name':'checks','head_sha':'abc123','event':'workflow_dispatch','status':'success','url':'http://x/runs/2'}]
+        self.assertEqual(ci.check(self.s,'demo',1,api,now=at(1))['结论'],'被跳过')
+        self.assertFalse(any('actions' in path for _,path in api.calls))
+
+    def test_only_every_success_passes(self):
+        cases=[
+            (pr(),st('success','success'),'通过'),
+            (pr(),st('skipped'),'被跳过'),          # Gitea 汇总会写 success，这里不认
+            (pr(),st('success','skipped'),'被跳过'),
+            (pr(),st('success','pending'),'没跑完'),
+            (pr(),st('running'),'没跑完'),
+            (pr(),st('success','failure'),'没通过'),
+            (pr(),st('pending','failure'),'没通过'),
+            (pr(),st('warning'),'没通过'),
+            (pr(),[],'没有检查'),
+            (pr(),[dict(st('success')[0],target_url='')],'没有执行记录'),
+            (pr(mergeable=False),st('success'),'有冲突'),
+            (pr(state='closed',merged=True),st('success'),'已合并'),
+            (pr(state='closed'),st('success'),'已关闭'),
+        ]
+        for p,s,want in cases:
+            with self.subTest(want=want,s=[x['status'] for x in s]):
+                r=ci.check(self.s,'demo',1,api=FakeApi(p,s),now=at(3))
+                self.assertEqual(r['结论'],want);self.assertEqual(r['能合并'],want=='通过')
+        r=ci.check(self.s,'演示',1,api=FakeApi(pr(state='closed',merged=True),st('success','pending')),now=at(1))
+        self.assertIn('合并时检查并没有全部通过',r['说明'])
+
+    def test_wait_until_finished_not_until_merge(self):
+        seq=iter([st('pending'),[],st('success','pending'),st('success','success')])
+        slept=[]
+        r=ci.wait(self.s,'demo',1,timeout=600,interval=5,api=FakeApi(pr(),lambda:next(seq)),sleep=slept.append,clock=lambda:0,now=at(1))
+        self.assertEqual((r['结论'],len(slept)),('通过',3))
+        now=[0]
+        def tick(x):now[0]+=x
+        r=ci.wait(self.s,'demo',1,timeout=30,interval=10,api=FakeApi(pr(),st('pending')),sleep=tick,clock=lambda:now[0])
+        self.assertTrue(r['超时']);self.assertEqual(r['结论'],'没跑完')
+
+    def test_no_run_after_minutes_is_reported_not_waited(self):
+        # NewBI PR165：分支切自旧 main，CI 一直没来，空等了 4 小时。从第一次看到「没有检查」起计时（审核 11-14：
+        # 提交时间可能很旧或在未来，PR 更新时间随便一改就重置，都不可靠）
+        r=ci.check(self.s,'demo',1,api=FakeApi(pr(),[]),now=at(0))
+        self.assertEqual(r['结论'],'没有检查');self.assertIn('0 分钟',r['说明'])
+        self.assertEqual(ci.check(self.s,'demo',1,api=FakeApi(pr(),[]),now=at(9))['结论'],'没有检查')
+        r=ci.check(self.s,'demo',1,api=FakeApi(pr(),[]),now=at(11))
+        self.assertEqual(r['结论'],'没触发');self.assertIn('把目标分支合进这个分支',r['说明']);self.assertIn('11 分钟',r['说明'])
+        # 新推的头提交重新计时；提交时间在未来也不会算出负数
+        future=FakeApi(pr(sha='new1'),[]);future.commit_time='2027-01-01T00:00:00+08:00'
+        r=ci.check(self.s,'demo',1,api=future,now=at(11));self.assertEqual(r['结论'],'没有检查');self.assertIn(' 0 分钟',r['说明'])
+        self.assertEqual(ci.check(self.s,'demo',1,api=FakeApi(pr(sha='new1'),[]),now=at(30),no_run_minutes=30)['结论'],'没有检查')
+        ticks=[0]
+        def tick(x):ticks[0]+=x
+        clock=lambda:ticks[0]
+        r=ci.wait(self.s,'demo',1,timeout=3600,interval=60,api=FakeApi(pr(sha='w1'),[]),sleep=tick,clock=clock,now=lambda:T0+ticks[0])
+        self.assertEqual(r['结论'],'没触发');self.assertLess(ticks[0],15*60)
+        # 复审 11-14：不同站点上同名仓库、同号 PR、同头提交，各算各的
+        other=FakeApi(pr(sha='abc123'),[])
+        from unittest.mock import patch
+        real=ci._identity
+        with patch.object(ci,'_identity',lambda path:dict(real(path),origin='https://other.example')):
+            r=ci.check(self.s,'demo',1,api=other,now=at(11))
+        self.assertEqual(r['结论'],'没有检查');self.assertIn(' 0 分钟',r['说明'])
+        # 0 秒的步骤正常：只看结果和执行记录，不看耗时
+        zero=[{'context':'CI / lint','status':'success','description':'Successful in 0s','target_url':'/r/actions/runs/9'}]
+        self.assertEqual(ci.check(self.s,'demo',1,api=FakeApi(pr(),zero),now=at(1))['结论'],'通过')
+
+    def test_merge_needs_confirm_and_passing_checks(self):
+        with self.assertRaises(Blocked):ci.merge(self.s,'demo',1,api=FakeApi(pr(),st('success')))
+        with self.assertRaises(Blocked):ci.merge(self.s,'demo',1,confirm=True,api=FakeApi(pr(),st('success')))  # 没写风险档
+        with self.assertRaises(Blocked):ci.merge(self.s,'demo',1,confirm=True,risk='高',api=FakeApi(pr(),st('success')))  # 高风险没写用户点头
+        merged=[]
+        r=ci.merge(self.s,'demo',1,confirm=True,risk='低',api=FakeApi(pr(),st('skipped')),merger=lambda *a:merged.append(a))
+        self.assertEqual((r['结论'],r['本次合并'],merged),('被跳过',False,[]))
+        state={'merged':False}
+        def current():
+            return pr(state='closed',merged=True)|{'merge_commit_sha':'m1'} if state['merged'] else pr(sha='abc123')
+        def do(idn,number,sha):
+            self.assertEqual((idn['repo'],number,sha),('test/demo',1,'abc123'));state['merged']=True
+        r=ci.merge(self.s,'demo',1,confirm=True,risk='低',api=FakeApi(current,st('success','success')),merger=do)
+        self.assertEqual((r['本次合并'],r['合并提交']),(True,'m1'))
+        self.assertEqual((self.s.get(ci.LOG)[-1]['风险'],self.s.get(ci.LOG)[-1]['用户点头']),('低',''))
+        log=self.s.get(ci.LOG)
+        self.assertEqual((log[-1]['PR'],log[-1]['头提交'],log[-1]['检查']),(1,'abc123',['CI / job0=success','CI / job1=success']))
+
+    def test_docs_only_rule(self):
+        from portable.ci_docs_only import classify
+        self.assertEqual(classify([('docs/说明.md','modified','')])[0],'docs')
+        self.assertEqual(classify([('STATUS.md','modified',''),('功能清单.md','modified','')])[0],'docs')
+        for files in ([('docs/x.py','added','')],[('portable/a.py','modified','')],[('docs/a.json','modified','')],
+                      [('docs/new.md','renamed','portable/old.py')],[],[('docs/../x.md','added','')]):
+            with self.subTest(files=files):self.assertEqual(classify(files)[0],'full')
+        self.assertEqual(classify([('docs/data.csv','modified','')],exclude=['docs/data.csv'])[0],'full')  # 人工名单
+        self.assertEqual(classify([('docs/data.csv','modified','')],referenced=lambda p:True)[0],'full')  # 被程序或测试引用
+        self.assertEqual(classify([('docs/避坑.md','modified','')],referenced=lambda p:True)[0],'docs')  # 项目记忆文件不做引用搜索
+        self.assertEqual(classify([('docs/x.md','modified','')],referenced=lambda p:1/0)[0],'full')  # 搜索出错按全量
+        from pathlib import Path
+        root=Path(__file__).resolve().parents[1]
+        self.assertEqual((root/'portable/ci_docs_only.py').read_bytes(),(root/'tools/ci/docs_only.py').read_bytes())  # 原件和 CI 用的那份字面一致
+
+    def test_docs_only_cli_on_real_git(self):
+        import os,sys,subprocess,tempfile
+        from pathlib import Path
+        script=Path(__file__).resolve().parents[1]/'tools/ci/docs_only.py'
+        with tempfile.TemporaryDirectory() as d:
+            g=lambda *a:subprocess.run(['git','-C',d,'-c','user.name=t','-c','user.email=t@t',*a],check=True,capture_output=True)
+            g('init','-q','-b','main');Path(d,'src').mkdir();Path(d,'src/x.py').write_text("open('docs/data.csv')\n")
+            Path(d,'docs').mkdir();Path(d,'docs/data.csv').write_text('a\n');Path(d,'docs/说明.md').write_text('a\n')
+            g('add','.');g('commit','-qm','base');g('branch','base')
+            run=lambda *a:subprocess.run([sys.executable,str(script),*a],cwd=d,capture_output=True,text=True).stdout.strip()
+            Path(d,'docs/说明.md').write_text('b\n');g('commit','-qam','doc')
+            self.assertEqual(run('--base','base'),'mode=docs')
+            Path(d,'docs/data.csv').write_text('b\n');g('commit','-qam','csv')
+            self.assertEqual(run('--base','base'),'mode=full')  # data.csv 被 src/x.py 读：走全量
+            self.assertEqual(run(),'mode=full')  # 不是 PR（没基线）：全量
+            self.assertEqual(run('--base','不存在的分支'),'mode=full')  # 读不到改动：全量
+
+    def test_merge_reconciles_ci_mode_when_repo_has_docs_gate(self):
+        def merged_api(files):
+            state={'merged':False}
+            api=FakeApi(lambda:pr(state='closed',merged=True) if state['merged'] else pr(),st('success'))
+            api.files=files;api.docs_gate=True
+            return api,state
+        code=[{'filename':'src/a.py','status':'changed'}];docs=[{'filename':'docs/a.md','status':'changed'}]
+        for files,log,ok in ((code,'随身开发CI模式=docs',False),(code,'',False),(code,'随身开发CI模式=full',True),(docs,'随身开发CI模式=docs',True),(docs,'随身开发CI模式=full',True)):
+            with self.subTest(files=files[0]['filename'],log=log):
+                api,state=merged_api(files)
+                run=lambda:ci.merge(self.s,'demo',1,confirm=True,risk='低',api=api,merger=lambda *a:state.update(merged=True),log_reader=lambda idn,link:log)
+                if ok:
+                    r=run();self.assertTrue(r['本次合并'])
+                    self.assertEqual(r['类别'],'代码类' if files is code else '文档类')
+                    self.assertEqual('提醒' in r,files is code)
+                else:
+                    with self.assertRaises(Blocked):run()
+                    self.assertFalse(state['merged'])
+        # 真实日志格式：先回显命令（带引号），再是输出行；只算输出那一行（11-16 验证 PR108 实测格式）
+        real_log='2026-11-16T00:00:01Z ##[group]Run echo "随身开发CI模式=full"\n2026-11-16T00:00:01Z echo "随身开发CI模式=${{ steps.mode.outputs.mode || \'full\' }}"\n2026-11-16T00:00:01Z 随身开发CI模式=full\n'
+        api,state=merged_api(code)
+        r=ci.merge(self.s,'demo',1,confirm=True,risk='低',api=api,merger=lambda *a:state.update(merged=True),log_reader=lambda idn,link:real_log)
+        self.assertTrue(r['本次合并']);self.assertEqual(r['CI模式'],'full')
+        # 没接轻量 CI 的仓库：不读日志，照旧合
+        api=FakeApi(lambda:pr(state='closed',merged=True) if api.done else pr(),st('success'));api.done=False;api.files=code
+        r=ci.merge(self.s,'demo',1,confirm=True,risk='低',api=api,merger=lambda *a:setattr(api,'done',True),log_reader=lambda idn,link:self.fail('不该读日志'))
+        self.assertEqual(r['CI模式'],'未接轻量CI')
+        # 改判定脚本的 PR 不能按低风险合
+        api=FakeApi(pr(),st('success'));api.files=[{'filename':'tools/ci/docs_only.py','status':'changed'}]
+        with self.assertRaises(Blocked) as e:ci.merge(self.s,'demo',1,confirm=True,risk='低',api=api,merger=lambda *a:None)
+        self.assertIn('CI 判定脚本',str(e.exception))
+
+    def test_merge_not_confirmed_by_readback_is_reported(self):
+        with self.assertRaises(Blocked) as e:
+            ci.merge(self.s,'demo',1,confirm=True,risk='低',api=FakeApi(pr(),st('success')),merger=lambda *a:None)
+        self.assertIn('不要直接重发',str(e.exception))
+
+    def test_low_risk_merge_refuses_ci_rule_gate_and_test_deletion(self):
+        # 审核 11-14：低风险自己合时，程序再查一遍改动文件，碰 CI、规矩、合并把关或删测试的不让按低风险合
+        cases=[('.gitea/workflows/ci.yml','changed','CI 配置'),('portable/protocol.json','changed','规矩'),('tools/gate/test_census.py','changed','合并把关'),
+               ('tests/test_x.py','deleted','删测试文件'),('src/tests/old_test.go','removed','删测试文件')]
+        for name,status,what in cases:
+            api=FakeApi(pr(),st('success'));api.files=[{'filename':'src/a.py','status':'changed'},{'filename':name,'status':status}]
+            merged=[]
+            with self.assertRaises(Blocked) as e:ci.merge(self.s,'demo',1,confirm=True,risk='低',api=api,merger=lambda *a:merged.append(a))
+            self.assertIn(what,str(e.exception));self.assertEqual(merged,[])
+        # 文件多于一页也要查到
+        api=FakeApi(pr(),st('success'));api.files=[{'filename':f'src/f{i}.py','status':'changed'} for i in range(60)]+[{'filename':'.github/workflows/x.yml','status':'added'}]
+        with self.assertRaises(Blocked):ci.merge(self.s,'demo',1,confirm=True,risk='低',api=api,merger=lambda *a:None)
+        # 复审 11-14：改名把高风险文件挪走、把测试文件改成别的，都要拦
+        for old,new,what in (('.github/workflows/ci.yml','archive/ci.yml','CI 配置'),('tests/test_auth.py','docs/example.py','测试文件改名'),
+                             ('tests/test_auth.py','tests/auth_test.py','测试文件改名'),('tests/test_auth.py','docs/test_auth.py','测试文件改名')):
+            api=FakeApi(pr(),st('success'));api.files=[{'filename':new,'status':'renamed','previous_filename':old}]
+            with self.assertRaises(Blocked) as e:ci.merge(self.s,'demo',1,confirm=True,risk='低',api=api,merger=lambda *a:None)
+            self.assertIn(what,str(e.exception))
+        # 复审 11-14：翻到页数上限还没读完，不拿半份清单放行
+        from unittest.mock import patch
+        api=FakeApi(pr(),st('success'));api.files=[{'filename':f'src/f{i}.py','status':'changed'} for i in range(100)]
+        with patch.object(ci,'MAX_FILE_PAGES',2):
+            with self.assertRaises(Blocked) as e:ci.merge(self.s,'demo',1,confirm=True,risk='低',api=api,merger=lambda *a:None)
+        self.assertIn('没法确认全部读完',str(e.exception))
+        # 复审 11-14：仓库有 development 分支时，合进 main 不能报低风险
+        api=FakeApi(pr(base='main'),st('success'));api.branches={'development'}
+        with self.assertRaises(Blocked) as e:ci.merge(self.s,'demo',1,confirm=True,risk='低',api=api,merger=lambda *a:None)
+        self.assertIn('development 分支',str(e.exception))
+        # 第三轮复审：认证、权限、限流失败不能当成「没有 development 分支」
+        for code in (401,403,429,None):
+            api=FakeApi(pr(base='main'),st('success'));api.branch_error=code;merged=[]
+            with self.assertRaises(Blocked) as e:ci.merge(self.s,'demo',1,confirm=True,risk='低',api=api,merger=lambda *a:merged.append(a))
+            self.assertIn('查不到这个仓库有没有',str(e.exception));self.assertEqual(merged,[])
+        # 明确 404（真没有 development）才按普通低风险继续
+        state3={'merged':False}
+        api=FakeApi(lambda:pr(state='closed',merged=True) if state3['merged'] else pr(base='main'),st('success'))
+        self.assertTrue(ci.merge(self.s,'demo',1,confirm=True,risk='低',api=api,merger=lambda *a:state3.update(merged=True))['本次合并'])
+        state2={'merged':False}
+        api=FakeApi(lambda:pr(state='closed',merged=True) if state2['merged'] else pr(base='development'),st('success'));api.branches={'development'}
+        self.assertTrue(ci.merge(self.s,'demo',1,confirm=True,risk='低',api=api,merger=lambda *a:state2.update(merged=True))['本次合并'])
+        # 高风险 + 用户点头出处：不查文件也能合，并记下出处
+        state={'merged':False}
+        api=FakeApi(lambda:pr(state='closed',merged=True) if state['merged'] else pr(),st('success'))
+        api.files=[{'filename':'portable/protocol.json','status':'changed'}]
+        r=ci.merge(self.s,'demo',1,confirm=True,risk='高',approval='用户 11-14「合」',api=api,merger=lambda *a:state.update(merged=True))
+        self.assertTrue(r['本次合并']);self.assertEqual(self.s.get(ci.LOG)[-1]['用户点头'],'用户 11-14「合」')
+
+    def test_missing_pr_says_so_and_lists_recent(self):
+        from portable.remote_publish import DeliveryError
+        def api(idn,method,path,payload=None):
+            if path.endswith('/pulls/999'):raise DeliveryError('rejected','既有 Gitea API 查询不可用',404)
+            if '/pulls?' in path:return [{'number':n} for n in (115,116,114)]
+            raise AssertionError(path)
+        with self.assertRaises(Blocked) as e:ci.check(self.s,'demo',999,api=api)
+        self.assertIn('没有这个 PR',str(e.exception));self.assertIn('116、115、114',str(e.exception))
+        def api_down(idn,method,path,payload=None):raise DeliveryError('sent_unknown','既有 Gitea API 查询不可用',502)
+        with self.assertRaises(DeliveryError):ci.check(self.s,'demo',999,api=api_down)  # 不是 404 的照旧报原错，不误说成「没有这个 PR」
+
+    def test_project_without_remote_or_unknown(self):
+        with self.assertRaises(Blocked):ci.check(self.s,'没有这个',1,api=FakeApi(pr(),st('success')))
+        subprocess.run(['git','-C',str(self.repo),'remote','remove','origin'],check=True)
+        with self.assertRaises(Blocked) as e:ci.check(self.s,'demo',1,api=FakeApi(pr(),st('success')))
+        self.assertIn('本地全量测试',str(e.exception))
+
+    def test_cli_requires_project_and_pr(self):
+        import sys
+        out=subprocess.run([sys.executable,'-m','portable','--root',str(self.s.root),'ci','check'],capture_output=True,text=True,cwd=Path(__file__).resolve().parents[1])
+        self.assertIn('要写项目和 PR 号',out.stdout+out.stderr)
+
+if __name__=='__main__':unittest.main()

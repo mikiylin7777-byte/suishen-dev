@@ -1,0 +1,38 @@
+name: 报告问题
+description: 用着出错了、和说明不一样
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: 谢谢反馈！请不要贴密码、token、API key、cookie。可以让 AI 运行 `assist help-bundle` 生成去密钥的求助包附上。
+  - type: input
+    id: version
+    attributes:
+      label: 随身开发版本
+      description: 安装目录里 发行.json 的 version
+      placeholder: 例如 0.2.53
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: macOS 版本和 Python 版本
+      placeholder: 例如 macOS 15.1，Python 3.9.6
+    validations:
+      required: true
+  - type: input
+    id: ai
+    attributes:
+      label: 用的是哪个 AI
+      placeholder: 例如 Claude Code、Codex、T3
+  - type: textarea
+    id: what
+    attributes:
+      label: 做了什么、看到了什么
+      description: 你说了什么、AI 做了什么、报错原文（照抄）
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 本来希望怎样

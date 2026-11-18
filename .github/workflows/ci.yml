@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Secret scan (gitleaks)
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar -xz gitleaks
+          ./gitleaks detect --source=. --no-banner --redact
+      - name: Personal info check
+        run: python3 tools/ci/privacy_check.py
+      - name: Test tools (age for encrypted transport tests)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq age
+      - name: Python tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s tests
+      - name: Bot adapter tests
+        run: |
+          (cd adapters/bots && npm ci --no-audit --no-fund)
+          node --test adapters/bots/test.mjs
+          node --test adapters/bots/sdk-smoke.mjs

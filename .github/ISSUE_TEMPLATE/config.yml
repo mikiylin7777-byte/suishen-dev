@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全问题（私下报告）
+    url: https://github.com/mikiylin7777-byte/suishen-dev/security/advisories/new
+    about: 可能泄露密钥、绕过把关等安全问题请走这里，不要公开提 Issue
