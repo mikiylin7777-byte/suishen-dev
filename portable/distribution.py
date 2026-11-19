@@ -13,7 +13,7 @@ from .core import Blocked, VERSION, Store, atomic, canonical, digest, identifier
 
 RUNTIME='工具/portable.pyz'
 
-def build(source,target,edition='full',markers=()):
+def build(source,target,edition='full',markers=(),repo=''):
     """edition='friend' 是给朋友的版本：打完检查包里没有打包人的个人信息。两种版本都不再带自带战队后台（11-17 停用）。"""
     if edition not in ('full','friend'):raise Blocked('版本只能是 full 或 friend')
     source,target=Path(source).absolute(),Path(target).absolute()
@@ -50,7 +50,8 @@ def build(source,target,edition='full',markers=()):
         atomic(candidate/'工具/开发协议.md','# 随身开发公共协议\n\n'+'\n'.join('- '+rule for rule in PROTOCOL['public_rules'])+'\n')
         entry=('# 随身开发入口\n\n先读 [公共协议](工具/开发协议.md)（机器单源 [协议](工具/协议.json)）和 [本机附加规则](数据/本机规则.md)（存在时），再读 看板/全部项目.md。\n'
                '用户在对话里用大白话说话；命令都由 AI 代为执行：python3 工具/portable.pyz --root <本目录> <命令>。\n'
-               '常用：overview（问进度）、move-in scan/adopt/undo（项目搬家）、assist undo-last/screenshot/help-bundle/example/window。\n'
+               '常用：overview（问进度）、move-in scan/adopt/undo（项目搬家）、assist undo-last/screenshot/help-bundle/example/window、upgrade check/apply/rollback（升级与退回）。\n'
+               '用户说「升级随身开发」或「看看随身开发有没有新版」：跑 upgrade check 看有没有新版，跑 upgrade apply 自动从 GitHub 下载最新版、核对 SHA256 并升级（用户给了新版 .zip 或文件夹路径时跑 upgrade apply <路径>）；要退回上一版跑 upgrade rollback。\n'
                '用户贴来的启动语里还写着 <随身开发目录> 时，它就是本文件所在的文件夹，AI 自己替换，不要让用户改。\n'
                '用户说换了电脑、要把项目接回来：跑 move-in rejoin <旧电脑备份文件夹>，先把计划给用户看，用户同意后带 --confirmed "<用户原话>" 执行；不要只拷文件夹、不要自己写脚本。\n'
                '用户要给某个项目开会话窗口：跑 assist window <项目>，把结果原样告诉用户（AI 没法替用户新开对话，只能给一句启动语让用户自己新开对话贴进去）；不要去读程序源码、不要解压 portable.pyz、不要自己写脚本。\n'
@@ -96,10 +97,13 @@ def build(source,target,edition='full',markers=()):
         entry='#!/bin/bash\nset -euo pipefail\nROOT="$(cd "$(dirname "$0")" && pwd)"\nif [ "$#" -eq 0 ]; then\n  python3 "$ROOT/工具/portable.pyz" --root "$ROOT" doctor\n  python3 "$ROOT/工具/portable.pyz" --root "$ROOT" wizard --if-needed || true\n  python3 "$ROOT/工具/portable.pyz" --root "$ROOT" t3-setup --if-needed || true\n  python3 "$ROOT/工具/portable.pyz" --root "$ROOT" menu\nelse\n  exec python3 "$ROOT/工具/portable.pyz" --root "$ROOT" "$@"\nfi\n'
         atomic(candidate/'开始使用.command',entry)
         os.chmod(candidate/'开始使用.command',0o755)
+        if repo:
+            import re
+            if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',repo):raise Blocked('--repo 要写成 账号/仓库名')
         runtime={p.relative_to(candidate).as_posix():digest(p.read_bytes()) for p in candidate.rglob('*') if p.is_file() and not p.relative_to(candidate).as_posix().startswith(('知识库/','数据/'))}
-        atomic(candidate/'发行.json',canonical({'schema':1,'version':VERSION,'files':runtime,**({'edition':'friend'} if edition=='friend' else {})}))
+        atomic(candidate/'发行.json',canonical({'schema':1,'version':VERSION,'files':runtime,**({'edition':'friend'} if edition=='friend' else {}),**({'repo':repo} if repo else {})}))
         if edition=='friend':
-            hits=personal_hits(candidate,markers)
+            hits=personal_hits(candidate,markers,repo=repo)
             if hits:raise Blocked('朋友版里有打包人的个人信息，未打包：'+'；'.join(hits[:10]))
         with lock(target.parent/'.portable-install.lock'):
             if target.exists():raise Blocked('目标并发出现')
@@ -119,10 +123,11 @@ def personal_markers(extra=(),local=True):
         if len(user)>=3:found+=['/'+user+'/',user+'@']
     return [m for m in dict.fromkeys([*found,*extra]) if m and m.strip()]
 
-def personal_hits(root,markers=(),local=True):
+def personal_hits(root,markers=(),local=True,repo=''):
     """逐个文件（含运行包里的每个模块）找个人信息，返回「文件：命中的词」。
-    纯英文字母的词按整词找（短词不会误中更长的英文单词），其余按原文找。"""
+    纯英文字母的词按整词找（短词不会误中更长的英文单词），其余按原文找；发行.json 里的升级仓库账号名放行。"""
     import re,zipfile
+    owner=repo.split('/')[0] if repo and '/' in repo else ''
     words=[]
     for m in personal_markers(markers,local):
         b=m.encode()
@@ -130,6 +135,7 @@ def personal_hits(root,markers=(),local=True):
     hits=[]
     def look(name,data):
         for m,rx,b in words:
+            if name=='发行.json' and owner and m in owner:continue
             if (rx.search(data) if rx else b in data):hits.append(name+'：'+m)
     for p in sorted(Path(root).rglob('*')):
         if not p.is_file():continue
@@ -143,7 +149,7 @@ def personal_hits(root,markers=(),local=True):
 def release_verify(path):
     root=Path(path).absolute()
     manifest=json.loads((root/'发行.json').read_text())
-    if manifest.get('schema')!=1 or manifest.get('version') not in ('0.1.0','0.1.1','0.1.2','0.1.3','0.1.4','0.1.5','0.2.0','0.2.1','0.2.2','0.2.3','0.2.4','0.2.5','0.2.6','0.2.7','0.2.8','0.2.9','0.2.10','0.2.11','0.2.12','0.2.13','0.2.14','0.2.15','0.2.16','0.2.17','0.2.18','0.2.19','0.2.20','0.2.21','0.2.22','0.2.23','0.2.24','0.2.25','0.2.26','0.2.27','0.2.28','0.2.29','0.2.30','0.2.31','0.2.32','0.2.33','0.2.34','0.2.35','0.2.36','0.2.37','0.2.38','0.2.39','0.2.40','0.2.41','0.2.42','0.2.43','0.2.44','0.2.45','0.2.46','0.2.47','0.2.48','0.2.49','0.2.50','0.2.51','0.2.52','0.2.53',VERSION):
+    if manifest.get('schema')!=1 or manifest.get('version') not in ('0.1.0','0.1.1','0.1.2','0.1.3','0.1.4','0.1.5','0.2.0','0.2.1','0.2.2','0.2.3','0.2.4','0.2.5','0.2.6','0.2.7','0.2.8','0.2.9','0.2.10','0.2.11','0.2.12','0.2.13','0.2.14','0.2.15','0.2.16','0.2.17','0.2.18','0.2.19','0.2.20','0.2.21','0.2.22','0.2.23','0.2.24','0.2.25','0.2.26','0.2.27','0.2.28','0.2.29','0.2.30','0.2.31','0.2.32','0.2.33','0.2.34','0.2.35','0.2.36','0.2.37','0.2.38','0.2.39','0.2.40','0.2.41','0.2.42','0.2.43','0.2.44','0.2.45','0.2.46','0.2.47','0.2.48','0.2.49','0.2.50','0.2.51','0.2.52','0.2.53','0.2.54','0.2.55',VERSION):
         raise Blocked('发行版本不兼容')
     for rel,h in manifest['files'].items():
         if rel not in ('开始使用.command','AGENTS.md','CLAUDE.md','使用说明.md','启动语.md',RUNTIME,'工具/bot_bridge.py','工具/协议.json','工具/开发协议.md') and not rel.startswith(('工具/adapters/','工具/team-host-release/')):

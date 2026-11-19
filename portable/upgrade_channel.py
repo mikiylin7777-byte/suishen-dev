@@ -6,15 +6,26 @@
 一条命令做完：停后台 → 确认没有在跑的任务 → 包外备份 → 换新版 → 恢复战队/项目登记/本机规则 → 开后台 → 自检读回。
 用户的数据、设置、项目登记都不动；退回只换程序文件，不丢升级后新增的数据。
 """
+import hashlib
+import json
 import os
+import re
 import subprocess
 import sys
 import time
 import tempfile
+import urllib.error
+import urllib.request
+import zipfile
 from pathlib import Path
 from .core import Blocked, Store
 
 LAST='upgrade:last'
+REPO_KEY='upgrade:repo'
+REPO_RX=re.compile(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
+GH_URL_RX=re.compile(r'^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git|/releases.*|/.*)?$')
+README_GH_RX=re.compile(r'https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)')
+SHA256_RX=re.compile(r'\b([0-9a-fA-F]{64})\b')
 
 def _ver(v):return tuple(int(x) for x in v.split('.'))
 
@@ -173,6 +184,7 @@ def upgrade(root,candidate,backup_dir=None,*,allow_older=False,launchctl=None,py
         s=Store(root)
         try:
             with s.db:s.db.execute("DELETE FROM meta WHERE key='upgrade:created-service'")
+            if new.get('repo') or cur.get('repo'):s.put(REPO_KEY,new.get('repo') or cur.get('repo'))
             try:s.put(LAST,{'from':result['from'],'to':result['to'],'previous_package':result['previous_package'],'backup':result['backup'],'receipt':result['receipt'],'created_service':str(Path.home()/'Library/LaunchAgents'/(supervisor.identity(root)+'.plist')) if created else None,'paused':was_paused})
             except Exception as e:failed.append('升级记录：'+str(e))
             try:health=s.doctor()
@@ -217,13 +229,164 @@ def rollback(root,launchctl=None,python=None):
     out=upgrade(root,prev,allow_older=True,launchctl=launchctl,python=python,_retire_service=path)
     return {**out,'退回':last['to']+' → '+last['from'],'后台兼容性':'升级新增的后台定义已停用归档；旧版不会自动运行新版配方' if last.get('created_service') else '保留原后台定义'}
 
+def _normalize_repo(value):
+    text=str(value or '').strip()
+    if not text:return None
+    m=GH_URL_RX.match(text)
+    if m:text=m.group(1)
+    if text.endswith('.git'):text=text[:-4]
+    return text if REPO_RX.match(text) else None
+
+def _resolve_repo(root,repo=None):
+    root=Path(root).absolute()
+    candidates=[repo,os.environ.get('PORTABLE_GITHUB_REPO')]
+    if (root/'发行.json').is_file():
+        try:candidates.append(json.loads((root/'发行.json').read_text(encoding='utf-8')).get('repo'))
+        except Exception:pass
+    if (root/'数据/state.sqlite').is_file():
+        s=Store(root)
+        try:candidates.append(s.get(REPO_KEY))
+        finally:s.db.close()
+    for md in (root/'README.md',root.parent/'README.md'):
+        if md.is_file():
+            try:
+                m=README_GH_RX.search(md.read_text(encoding='utf-8'))
+                if m:candidates.append(m.group(1))
+            except OSError:pass
+    for item in candidates:
+        slug=_normalize_repo(item)
+        if slug:return slug
+    raise Blocked('还没有设置 GitHub 升级仓库：请用 upgrade apply 账号/仓库名，或给出新版 .zip / 目录路径')
+
+def _fetch_release_json(slug):
+    url=f'https://api.github.com/repos/{slug}/releases/latest'
+    req=urllib.request.Request(url,headers={'Accept':'application/vnd.github+json','User-Agent':'suishen-dev-updater'})
+    try:
+        with urllib.request.urlopen(req,timeout=30) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        if e.code==404:raise Blocked(f'GitHub 仓库 {slug} 没有找到已发布的 Release')
+        raise Blocked(f'查询 GitHub Release 失败（HTTP {e.code}）：{slug}')
+    except Exception as e:
+        raise Blocked(f'连不上 GitHub（{slug}）：{e}')
+
+def check_remote(root,repo=None,*,fetch_json=None):
+    from .distribution import release_verify
+    root=Path(root).absolute()
+    cur=release_verify(root)['version']
+    slug=_resolve_repo(root,repo)
+    data=(fetch_json or _fetch_release_json)(slug)
+    if not isinstance(data,dict):raise Blocked('GitHub Release 返回格式读不懂')
+    tag=str(data.get('tag_name') or '').strip().lstrip('vV')
+    if not re.fullmatch(r'\d+\.\d+\.\d+',tag):
+        raise Blocked('GitHub Release 版本号格式不对：'+str(data.get('tag_name') or ''))
+    assets=[a for a in (data.get('assets') or []) if isinstance(a,dict) and str(a.get('name') or '').lower().endswith('.zip')]
+    if not assets:raise Blocked(f'GitHub Release v{tag} 里没有 .zip 安装包')
+    preferred=[a for a in assets if str(a.get('name') or '').startswith('suishen-dev-')]
+    asset=(preferred or assets)[0]
+    url=str(asset.get('browser_download_url') or '').strip()
+    if not url.startswith('https://'):raise Blocked('GitHub Release 下载地址不是 https://')
+    digest=str(asset.get('digest') or '').strip()
+    sha=digest.split(':',1)[1].lower() if digest.lower().startswith('sha256:') and SHA256_RX.fullmatch(digest.split(':',1)[1]) else None
+    body=str(data.get('body') or '').strip()
+    if not sha:
+        m=SHA256_RX.search(body)
+        if m:sha=m.group(1).lower()
+    s=Store(root)
+    try:s.put(REPO_KEY,slug)
+    finally:s.db.close()
+    return {'仓库':slug,'当前版本':cur,'最新版本':tag,'有新版':_ver(tag)>_ver(cur),'安装包':asset['name'],'下载地址':url,'sha256':sha,'更新说明':body}
+
+def _extract_zip(zip_path,dest_dir,expected_sha256=None):
+    zip_path=Path(zip_path).expanduser().resolve()
+    dest_dir=Path(dest_dir).resolve()
+    if not zip_path.is_file():raise Blocked('找不到安装包文件：'+str(zip_path))
+    actual=hashlib.sha256(zip_path.read_bytes()).hexdigest().lower()
+    if expected_sha256:
+        want=str(expected_sha256).strip().lower()
+        if actual!=want:raise Blocked(f'安装包 SHA256 校验失败：期望 {want}，实际 {actual}')
+    try:zf=zipfile.ZipFile(zip_path)
+    except zipfile.BadZipFile:raise Blocked('不是有效的 .zip 压缩包：'+str(zip_path))
+    with zf:
+        for info in zf.infolist():
+            name=info.filename
+            if name.startswith(('/','\\')) or '..' in Path(name).parts:
+                raise Blocked('压缩包含不安全路径：'+name)
+            mode=(info.external_attr>>16)&0o170000
+            if mode==0o120000:raise Blocked('压缩包含符号链接，拒绝解压：'+name)
+            target=(dest_dir/name).resolve()
+            if not (target==dest_dir or target.is_relative_to(dest_dir)):
+                raise Blocked('压缩包路径越界：'+name)
+            if info.is_dir():target.mkdir(parents=True,exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True,exist_ok=True)
+                target.write_bytes(zf.read(info))
+                perm=(info.external_attr>>16)&0o777
+                if perm&0o111:os.chmod(target,perm)
+    if (dest_dir/'发行.json').is_file():return dest_dir,actual
+    if (dest_dir/'随身开发'/'发行.json').is_file():return dest_dir/'随身开发',actual
+    found=[p for p in dest_dir.iterdir() if p.is_dir() and (p/'发行.json').is_file()]
+    if len(found)==1:return found[0],actual
+    raise Blocked('压缩包里找不到随身开发（缺少 发行.json）')
+
+def _download_zip(url,dest_file,urlopen=None):
+    url=str(url or '').strip()
+    if not url.startswith('https://'):raise Blocked('下载地址必须是 https:// 开头')
+    req=urllib.request.Request(url,headers={'User-Agent':'suishen-dev-updater'})
+    try:
+        with (urlopen or urllib.request.urlopen)(req,timeout=120) as resp:
+            Path(dest_file).write_bytes(resp.read())
+    except Exception as e:
+        raise Blocked(f'下载安装包失败（{url}）：{e}')
+
+def _is_local_or_zip_url(candidate):
+    if not candidate:return False
+    text=str(candidate).strip()
+    if text.startswith(('https://','http://')):
+        return text.lower().endswith('.zip') or '/releases/download/' in text
+    if text.startswith(('/','./','../','~')) or text.lower().endswith('.zip'):return True
+    if Path(text).expanduser().exists():return True
+    return _normalize_repo(text) is None
+
+def apply_target(root,candidate=None,backup_dir=None,*,repo=None,sha256=None,launchctl=None,python=None,fetch_json=None,urlopen=None):
+    if not repo and _is_local_or_zip_url(candidate):
+        text=str(candidate).strip()
+        if text.startswith(('https://','http://')):
+            with tempfile.TemporaryDirectory(prefix='portable-up-') as tmp:
+                pkg=Path(tmp)/'pkg.zip'
+                _download_zip(text,pkg,urlopen=urlopen)
+                extracted,actual=_extract_zip(pkg,Path(tmp)/'unpacked',sha256)
+                out=upgrade(root,extracted,backup_dir,launchctl=launchctl,python=python)
+                return {**out,'来源':text,'sha256':actual}
+        p=Path(text).expanduser()
+        if p.is_file() and p.suffix.lower()=='.zip':
+            with tempfile.TemporaryDirectory(prefix='portable-up-') as tmp:
+                extracted,actual=_extract_zip(p,Path(tmp)/'unpacked',sha256)
+                out=upgrade(root,extracted,backup_dir,launchctl=launchctl,python=python)
+                return {**out,'来源':str(p.absolute()),'sha256':actual}
+        return upgrade(root,p,backup_dir,launchctl=launchctl,python=python)
+    info=check_remote(root,repo or candidate,fetch_json=fetch_json)
+    if _ver(info['最新版本'])==_ver(info['当前版本']):
+        raise Blocked('已经是 '+info['当前版本']+'，不用升级')
+    if _ver(info['最新版本'])<_ver(info['当前版本']):
+        raise Blocked(f'新版 {info["最新版本"]} 比正在用的 {info["当前版本"]} 还旧；要退回请用 upgrade rollback')
+    with tempfile.TemporaryDirectory(prefix='portable-up-') as tmp:
+        pkg=Path(tmp)/info['安装包']
+        _download_zip(info['下载地址'],pkg,urlopen=urlopen)
+        extracted,actual=_extract_zip(pkg,Path(tmp)/'unpacked',sha256 or info.get('sha256'))
+        out=upgrade(root,extracted,backup_dir,launchctl=launchctl,python=python)
+    s=Store(root)
+    try:s.put(REPO_KEY,info['仓库'])
+    finally:s.db.close()
+    return {**out,'来源':info['仓库'],'安装包':info['安装包'],'sha256':actual}
+
 def run(args):
-    if args.action=='apply':
-        if not args.candidate:raise Blocked('要给出新版目录')
-        return upgrade(args.root,args.candidate,args.backup)
+    if args.action=='check':return check_remote(args.root,args.repo or args.candidate)
+    if args.action=='apply':return apply_target(args.root,args.candidate,args.backup,repo=args.repo,sha256=args.sha256)
     return rollback(args.root)
 
 def register(subparser):
-    p=subparser.add_parser('upgrade',help='一句话升级：apply <新版目录> / rollback 退回上一版')
-    p.add_argument('action',choices=['apply','rollback']);p.add_argument('candidate',nargs='?');p.add_argument('--backup')
+    p=subparser.add_parser('upgrade',help='一句话升级：check [仓库] 查新版 / apply [目录|.zip|仓库] 升级 / rollback 退回上一版')
+    p.add_argument('action',choices=['apply','check','rollback']);p.add_argument('candidate',nargs='?')
+    p.add_argument('--backup');p.add_argument('--repo',default='');p.add_argument('--sha256',default='')
     p.set_defaults(upgrade_run=run);return p

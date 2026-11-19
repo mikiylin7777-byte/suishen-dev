@@ -125,7 +125,10 @@ class NudgeTest(unittest.TestCase):
             '有正在跑的回合': dict(t3=dict(active='r2')),
             '有后台任务': dict(t3=dict(background=['task-1'])),
             '有等回答的请求': dict(t3=dict(pending=1)),
-            '用户 30 分钟内说过话': dict(t3=dict(idle=15 * 60)),
+            '对话刚停下不到 10 分钟': dict(t3=dict(idle=5 * 60)),
+            'AI 说要做但在问用户': dict(progress=dict(age=20 * 60), t3=dict(idle=15 * 60, messages=[
+                {'role': 'user', 'runId': 'r1', 'text': '做 A'},
+                {'role': 'assistant', 'runId': 'r1', 'text': '接下来我会改三处。要现在开工吗？'}])),
             '等谁是用户': dict(progress=dict(who='用户定方案')),
             '状态暂缓': dict(progress=dict(state='暂缓（等需求）')),
             '已全部完成': dict(progress=dict(goal='完成 3 块 / 共 3 块')),
@@ -152,9 +155,38 @@ class NudgeTest(unittest.TestCase):
         self.assertTrue(self.tick(night)['night'])
         early = dt.datetime.fromtimestamp(self.now).replace(hour=7, minute=59).timestamp()
         self.assertTrue(self.tick(early)['night'])
+        self.assertEqual(self.calls('send') + self.calls('start'), [])
+        (self.fake / 'calls.jsonl').unlink(missing_ok=True)
         settings.set_value(self.s, 'auto_continue', False)
         self.assertTrue(self.tick()['off'])
         self.assertEqual(self.calls(), [])
+
+    def test_night_wakes_thread_when_user_still_awake(self):
+        night = dt.datetime.fromtimestamp(self.now).replace(hour=0, minute=51).timestamp()
+        stopped = [{'role': 'user', 'runId': 'r1', 'text': '帮我查运单'},
+                   {'role': 'assistant', 'runId': 'r1', 'text': '先说结论……【未完成】接下来我会先查线上单号。'}]
+        self.progress(at=night, age=20 * 60)
+        self.t3(at=night, idle=10 * 60, messages=stopped)
+        result = self.tick(night)
+        self.assertTrue(result['night'])
+        self.assertEqual(result['sent'], ['甲'])
+        self.assertIn('上一轮你说了接下来要做的事，但停下来了', self.calls('send')[0][4])
+        self.assertEqual(self.log()[-1]['原因'], '说了要做却停了')
+
+    def test_night_leaves_sleeping_user_and_new_threads_alone(self):
+        night = dt.datetime.fromtimestamp(self.now).replace(hour=2, minute=0).timestamp()
+        self.progress(at=night)
+        self.t3(at=night, idle=61 * 60)
+        self.assertIn('当作睡了', self.tick(night)['skipped']['甲'])
+        mine = [{'role': 'user', 'runId': 'r2', 'text': nudge.message('甲', 2, '3 小时')}]
+        self.t3(at=night, idle=11 * 60, messages=mine, latest='r2')  # 后台自己的提醒不算人醒着
+        self.assertIn('当作睡了', self.tick(night)['skipped']['甲'])
+        self.t3(at=night, threads=[])
+        self.assertEqual(self.tick(night)['skipped']['甲'], '夜里不新开对话')
+        with patch.object(nudge, 'find_cli', return_value=None):
+            self.s.put(nudge.CLOCK, {})
+            self.assertIn('看不到用户在不在', nudge.tick(self.s, night)['skipped']['甲'])
+        self.assertEqual(self.calls('send') + self.calls('start'), [])
 
     # —— 刹车 ——
     def test_gap_daily_cap_and_named_after_three_unmoved(self):
@@ -256,11 +288,31 @@ class NudgeTest(unittest.TestCase):
         self.t3(idle=11 * 60, messages=mine, latest='r2')
         self.assertEqual(self.tick()['sent'], ['甲'])
 
+    def test_promise_then_stop_after_ten_minutes(self):
+        self.progress(age=20 * 60)  # 进度表刚动过，但 AI 说了接下来要做又停了
+        stopped = [{'role': 'user', 'runId': 'r1', 'text': '做 A'},
+                   {'role': 'assistant', 'runId': 'r1', 'text': 'A 的结论如下。接下来我会去查线上单号。'}]
+        self.t3(idle=5 * 60, messages=stopped)
+        self.assertEqual(self.tick()['skipped']['甲'], '对话刚停下不到 10 分钟')
+        self.t3(idle=11 * 60, messages=stopped)  # 用户这一轮发过话也照叫：AI 答完了，是用户在等它
+        self.assertEqual(self.tick()['sent'], ['甲'])
+        self.assertIn('上一轮你说了接下来要做的事，但停下来了', self.calls('send')[0][4])
+
+    def test_promise_words(self):
+        for text in ('接下来我会先查。', '【未完成】还差两处', '我现在去跑测试'):
+            self.assertTrue(nudge.promised(text), text)
+        for text in ('都做完了。', '接下来我会改三处，可以吗？', ''):
+            self.assertFalse(nudge.promised(text), text)
+
+    def test_user_answered_turn_does_not_wait_thirty_minutes(self):
+        self.t3(idle=11 * 60)  # 这一轮用户发起、AI 已回，进度表 3 小时没动
+        self.assertEqual(self.tick()['sent'], ['甲'])
+
     def test_user_message_in_empty_turn_waits_thirty_minutes(self):
         typed = [{'role': 'user', 'runId': 'r2', 'text': '继续'}]
         self.progress(age=20 * 60)
         self.t3(idle=11 * 60, messages=typed, latest='r2')
-        self.assertEqual(self.tick()['skipped']['甲'], '用户 30 分钟内在这个对话说过话')
+        self.assertEqual(self.tick()['skipped']['甲'], '用户发了话、AI 没回，等满 30 分钟')
         self.t3(idle=31 * 60, messages=typed, latest='r2')
         self.assertEqual(self.tick()['sent'], ['甲'])
 

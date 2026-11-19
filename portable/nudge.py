@@ -26,17 +26,21 @@ GAP = 2 * 3600        # 同一项目两次提醒至少隔 2 小时
 DAILY_MAX = 3         # 一天最多 3 次
 UNMOVED_MAX = 3       # 连叫 3 次进度表不动，改为看板点名
 EMPTY_IDLE = 600      # 空回合：对话空闲满 10 分钟
-USER_QUIET = 1800     # 用户 30 分钟内在对话里说过话就不叫
-NIGHT = (23, 8)       # 23:00～08:00 不叫
+USER_QUIET = 1800     # 用户发了话、AI 还没回就停了：等 30 分钟再叫
+NIGHT = (23, 8)       # 23:00～08:00 只叫用户还醒着的对话
+NIGHT_AWAKE = 3600    # 夜里：这个对话最近一轮是用户发起、停下不到 1 小时，算人还在
 NAMED_MAX = 3         # 看板点名最多 3 条
 IDLE_STATES = ('completed', 'idle')
 EMPTY_NEXT = ('', '-', '无', '暂无', '没有')
+PROMISES = ('接下来我会', '接下来我先', '接下来我去', '接下来我就', '我现在去', '我现在就去', '我这就去', '我马上去',
+            '下一步我会', '下一步我去', '稍后我会', '【未完成】', '还没做完')
 
 
-def message(name, left, hours_text, empty=False):
+def message(name, left, hours_text, empty=False, promised=False):
     """发给对话的固定提醒。left 为 None 时表示没写块数、靠功能清单「🔄 进行中」判断的。"""
     what = f'长期目标还差 {left} 块' if left is not None else '功能清单还有进行中的'
-    empty_text = '上一轮被叫醒后没回话就结束了；' if empty else ''
+    empty_text = ('上一轮被叫醒后没回话就结束了；' if empty
+                  else '上一轮你说了接下来要做的事，但停下来了；' if promised else '')
     return (f'{PREFIX}：{name}{what}，{empty_text}进度表 {hours_text}没更新。'
             '先查你在等的东西有没有结果，再接着做下一块；只做已经授权的事，上线、改真实数据、账号密钥、花钱或对外发消息照旧先问用户。'
             '做不了就在 STATUS.md 写清卡在哪、在等谁。这句话只是提醒，不算任何授权。')
@@ -47,6 +51,12 @@ def _span(seconds):
     if seconds >= 3600:
         return f'{seconds // 3600} 小时'
     return f'{max(1, seconds // 60)} 分钟'
+
+
+def promised(text):
+    """AI 最后一句写了「接下来我会」「【未完成】」这类话，又不是在问用户（结尾带问号的算在等用户回答）。"""
+    text = str(text or '').strip()
+    return any(word in text for word in PROMISES) and not any(mark in text[-60:] for mark in ('？', '?'))
 
 
 def _night(now):
@@ -176,9 +186,11 @@ def look(cli, thread, now):
         return None, '读不到对话最后活动时间，先不叫'
     latest = info.get('latestRunId')
     run = [m for m in messages if isinstance(m, dict) and m.get('runId') == latest] if latest else []
-    replied = any(m.get('role') == 'assistant' and str(m.get('text') or '').strip() for m in run)
+    replies = [str(m.get('text') or '') for m in run if m.get('role') == 'assistant' and str(m.get('text') or '').strip()]
     user = any(m.get('role') == 'user' and not str(m.get('text') or '').startswith(PREFIX) for m in run)
-    return {'idle': now - updated, 'empty': bool(latest) and not replied, 'user': user}, ''
+    # user：这一轮是用户自己发起的（不是后台提醒）；talking：用户发了话、AI 一个字没回
+    return {'idle': now - updated, 'empty': bool(latest) and not replies, 'user': user,
+            'talking': user and not replies, 'promised': bool(replies) and promised(replies[-1])}, ''
 
 
 def _send(cli, thread, text, entry, name):
@@ -270,8 +282,7 @@ def tick(store, now=None, cli=None):
             store.put(NOTES, {})
             store.put('runner:board', '')
         return {'off': True}
-    if _night(now):
-        return {'night': True}
+    night = _night(now)
     hours = settings_load(store).get('auto_continue_hours') or 2
     cli = cli or find_cli(store)
     book = dict(store.get(STATE) or {})
@@ -281,7 +292,7 @@ def tick(store, now=None, cli=None):
     skipped = {}
     for entry in load(store):
         try:
-            outcome = _project(store, entry, now, hours, cli, book, waiting_on_owner)
+            outcome = _project(store, entry, now, hours, cli, book, waiting_on_owner, night)
         except Exception as error:  # 一个项目出错不影响别的项目
             outcome = ('skip', '出错：' + type(error).__name__)
         kind, detail = outcome
@@ -296,10 +307,13 @@ def tick(store, now=None, cli=None):
             skipped[name] = detail
     store.put(STATE, book)
     _write_board(store, named, unreachable)
-    return {'sent': sent, 'named': named, 'unreachable': unreachable, 'skipped': skipped}
+    result = {'sent': sent, 'named': named, 'unreachable': unreachable, 'skipped': skipped}
+    if night:
+        result['night'] = True
+    return result
 
 
-def _project(store, entry, now, hours, cli, book, waiting_on_owner):
+def _project(store, entry, now, hours, cli, book, waiting_on_owner, night=False):
     row = project_row(store, entry)
     name = row['项目']
     if not (row['状态'] or '').startswith('进行中'):
@@ -328,25 +342,34 @@ def _project(store, entry, now, hours, cli, book, waiting_on_owner):
         return 'skip', '今天已经叫了 3 次'
     if mine.get('sent') and now - max(mine['sent']) < GAP:
         return 'skip', '离上次提醒不到 2 小时'
+    if night and not cli:
+        return 'skip', '夜里，看不到用户在不在，不叫'
     if not cli:
         return ('unreachable', '没接 T3，后台叫不醒它') if stale >= hours * 3600 else ('skip', '进度表刚更新过')
     thread, why = pick_thread(cli, entry['path'])
     if thread is None:
         return ('unreachable', why) if stale >= hours * 3600 else ('skip', why)
-    empty = False
-    if thread != 'new':
+    empty = said = False
+    if thread == 'new':
+        if night:
+            return 'skip', '夜里不新开对话'
+    else:
         seen, why = look(cli, thread, now)
         if seen is None:
             return 'skip', why
-        if seen['user'] and seen['idle'] < USER_QUIET:
-            return 'skip', '用户 30 分钟内在这个对话说过话'
+        if night and not (seen['user'] and seen['idle'] < NIGHT_AWAKE):
+            return 'skip', '夜里，用户最近 1 小时没在这个对话说话，当作睡了'
+        if seen['talking'] and seen['idle'] < USER_QUIET:
+            return 'skip', '用户发了话、AI 没回，等满 30 分钟'
         if seen['idle'] < EMPTY_IDLE:
             return 'skip', '对话刚停下不到 10 分钟'
         empty = seen['empty']
-    if not empty and stale < hours * 3600:
+        said = seen['promised']
+    if not empty and not said and stale < hours * 3600:
         return 'skip', '进度表刚更新过'
-    reason = '空回合：上一轮没有 AI 回复' if empty else ('没有能用的对话，新开一个' if thread == 'new' else f'进度表 {_span(stale)}没更新')
-    ok, thread, detail = _send(cli, thread, message(name, left, _span(stale), empty), entry, name)
+    reason = ('空回合：上一轮没有 AI 回复' if empty else '说了要做却停了' if said
+              else '没有能用的对话，新开一个' if thread == 'new' else f'进度表 {_span(stale)}没更新')
+    ok, thread, detail = _send(cli, thread, message(name, left, _span(stale), empty, said), entry, name)
     _log(store, {'时间': dt.datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M'), 'ts': now, '项目': name,
                  '项目编号': entry['id'], '对话': thread, '原因': reason, '已发': ok, '说明': detail})
     if not ok:

@@ -13,12 +13,12 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from portable.distribution import build
 from portable.core import Blocked,canonical
 
-def package(output,markers=()):
+def package(output,markers=(),repo=''):
     output=Path(output).absolute()
     if output.exists():raise Blocked('输出文件已存在，不覆盖：'+str(output))
     with tempfile.TemporaryDirectory() as d:
         root=Path(d).resolve()/'随身开发'
-        info=build(Path(__file__).resolve().parents[1],root,'friend',markers)
+        info=build(Path(__file__).resolve().parents[1],root,'friend',markers,repo=repo)
         output.parent.mkdir(parents=True,exist_ok=True)
         tmp=output.with_name('.'+output.name+'.part')
         with zipfile.ZipFile(tmp,'w',zipfile.ZIP_DEFLATED) as z:
@@ -31,7 +31,7 @@ def package(output,markers=()):
     return {'朋友版':str(output),'版本':info['version'],'个人信息检查':'通过'}
 
 if __name__=='__main__':
-    a=argparse.ArgumentParser();a.add_argument('output');a.add_argument('--marker',action='append',default=[]);args=a.parse_args()
-    try:print(canonical(package(args.output,args.marker)))
+    a=argparse.ArgumentParser();a.add_argument('output');a.add_argument('--marker',action='append',default=[]);a.add_argument('--repo',default='');args=a.parse_args()
+    try:print(canonical(package(args.output,args.marker,args.repo)))
     except (Blocked,OSError) as e:
         print(canonical({'status':'BLOCKED','reason':str(e)}),file=sys.stderr);sys.exit(2)

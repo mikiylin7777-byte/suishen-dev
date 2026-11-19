@@ -22,6 +22,9 @@ Requirements: macOS, Python 3.9+.
 2. Unzip and move the `随身开发` folder into your home folder.
 3. Double-click `开始使用.command` and answer a few setup questions.
 
+## Upgrade & Rollback
+Tell your AI: "把随身开发升级到最新版" (`python3 ~/随身开发/工具/portable.pyz --root ~/随身开发 upgrade apply`), which checks GitHub Releases, verifies the SHA256 digest and upgrades in place. Say "退回上一版" (`upgrade rollback`) to roll back.
+
 ## Develop
 ```bash
 python3 -m unittest discover -s tests
