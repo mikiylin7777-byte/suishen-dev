@@ -1,10 +1,13 @@
+# 日常小版本升级不自动提 PR（open-pull-requests-limit: 0），只由 GitHub 安全漏洞提醒触发修复 PR
 version: 2
 updates:
   - package-ecosystem: npm
     directory: /adapters/bots
     schedule:
-      interval: weekly
+      interval: monthly
+    open-pull-requests-limit: 0
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+    open-pull-requests-limit: 0
