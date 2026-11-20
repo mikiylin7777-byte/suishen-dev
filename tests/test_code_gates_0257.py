@@ -140,19 +140,21 @@ class CodeGates0257Test(unittest.TestCase):
     def test_test_gate_requires_trunk_sync_and_limits_one_full_at_a_time(self):
         remote = self._use_local_remote()
         cached_main = test_gate._git(self.repo, 'rev-parse', 'origin/main')[1]
-        # 主干领先当前分支时：要求先同步主干
-        _git(self.repo, 'switch', '-q', 'main')
-        (self.repo / 'src/other.py').write_text('y = 1\n')
-        _git(self.repo, 'add', '.')
-        _git(self.repo, 'commit', '-qm', 'trunk-ahead')
-        _git(self.repo, 'push', '-q', str(remote), 'main')
-        _git(self.repo, 'switch', '-q', 'feat')
+        # A separate checkout pushes so no Git version can refresh the tested checkout's ref.
+        writer = self.t / 'upstream-writer'
+        _git(self.t, 'clone', '-q', str(remote), str(writer))
+        (writer / 'src/other.py').write_text('y = 1\n')
+        _git(writer, 'add', '.')
+        _git(writer, 'commit', '-qm', 'trunk-ahead')
+        _git(writer, 'push', '-q', 'origin', 'main')
         self.assertEqual(test_gate._git(self.repo, 'rev-parse', 'origin/main')[1], cached_main)
         with self.assertRaisesRegex(Blocked, 'origin/main.*先同步主干'):
             test_gate.plan_run(self.s, 'demo')
 
         # 同步主干后：放行
-        _git(self.repo, 'merge', '-q', 'main')
+        _git(self.repo, 'fetch', '-q', '--refmap=', 'origin', 'main')
+        _git(self.repo, 'merge', '-q', 'FETCH_HEAD')
+        self.assertEqual(test_gate._git(self.repo, 'rev-parse', 'origin/main')[1], cached_main)
         plan = test_gate.plan_run(self.s, 'demo')
         self.assertEqual(plan['mode'], 'full')
         self.assertNotEqual(plan['trunk_sha'], cached_main)
