@@ -203,6 +203,179 @@ class CiTest(unittest.TestCase):
         with self.assertRaises(Blocked) as e:ci.merge(self.s,'demo',1,confirm=True,risk='低',api=api,merger=lambda *a:None)
         self.assertIn('CI 判定脚本',str(e.exception))
 
+    def _release_fixture(self, mixed_source=False, moved_progress=False):
+        def git(*args):
+            return subprocess.run(
+                ['git', '-C', str(self.repo), '-c', 'user.name=test', '-c', 'user.email=test@example.com', *args],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+
+        git('checkout', '-qb', 'main')
+        progress = self.repo / 'STATUS.md'
+        initial_progress = progress
+        if moved_progress:
+            initial_progress = self.repo / 'docs' / 'progress.md'
+            initial_progress.parent.mkdir()
+        initial_progress.write_text('Before the release')
+        git('add', '.')
+        git('commit', '-qm', 'Previous release')
+        git('branch', 'development')
+        git('commit', '--allow-empty', '-qm', 'Previous release merge on main')
+        base = git('rev-parse', 'HEAD')
+        records = {}
+        repo = {'full_name': 'test/demo'}
+
+        def source_pr(number, branch, edit):
+            git('checkout', '-qb', branch, 'development')
+            edit()
+            git('add', '.')
+            git('commit', '-qm', branch)
+            source = git('rev-parse', 'HEAD')
+            git('checkout', '-q', 'development')
+            git('merge', '--no-ff', '-qm', f"Merge pull request '{branch}' (#{number}) from test/{branch} into development", source)
+            records[number] = {'merged': True, 'merge_commit_sha': git('rev-parse', 'HEAD'),
+                               'base': {'ref': 'development', 'repo': repo}, 'head': {'sha': source}}
+
+        def feature():
+            (self.repo / 'app.py').write_text('print(1)')
+            if mixed_source:
+                progress.write_text('Feature progress')
+            if moved_progress:
+                initial_progress.rename(progress)
+        source_pr(2, 'feature', feature)
+        source_pr(3, 'progress', lambda: progress.write_text('Release progress'))
+        head = git('rev-parse', 'HEAD')
+        git('commit', '--allow-empty', '-qm', 'Later work on development')
+        development = git('rev-parse', 'HEAD')
+        release = dict(pr(sha=head), base={'ref': 'main', 'sha': base, 'repo': repo})
+        files = [{'filename': 'app.py', 'status': 'added'}, {'filename': 'STATUS.md', 'status': 'changed'}]
+        merged_sha = 'f' * 40
+        checks = st('success', 'success')
+        for job_id, check_row in enumerate(checks, 20):
+            check_row['target_url'] = f'/test/demo/actions/runs/10/jobs/{job_id}'
+
+        assert_equal = self.assertEqual
+
+        class ReleaseApi(FakeApi):
+            def __call__(self, idn, method, path, payload=None):
+                assert_equal(method, 'GET')
+                if path.endswith('/branches/development'):
+                    return {'commit': {'id': self.development}}
+                if path.endswith(f'/git/commits/{merged_sha}'):
+                    return {'parents': [{'sha': parent} for parent in self.merged_parents]}
+                if path.endswith('/actions/runs/10'):
+                    return {'head_sha': head, 'event': 'pull_request', 'status': 'completed', 'conclusion': 'success',
+                            'pull_requests': [{'number': self.ci_pr, 'base': {'ref': 'main'}}]}
+                if path.endswith('/actions/runs/10/jobs?limit=100'):
+                    return {'jobs': [{'id': job_id, 'run_id': 10, 'head_sha': head,
+                                      'status': 'completed', 'conclusion': 'success'} for job_id in (20, 21)]}
+                if '/pulls/' in path and '/files' not in path:
+                    number = int(path.rsplit('/', 1)[1])
+                    if number != 1:
+                        return records[number]
+                    self.release_reads += 1
+                    if self.move_base and self.release_reads >= 3:
+                        return dict(self.pr, base=dict(self.pr['base'], sha=development))
+                return super().__call__(idn, method, path, payload)
+
+        api = ReleaseApi(release, checks)
+        api.ci_pr = 1
+        api.merged_sha = merged_sha
+        api.merged_parents = [base, head]
+        api.files = files
+        api.docs_gate = True
+        api.development = development
+        api.release_reads = 0
+        api.move_base = False
+        return api, head, records
+
+    def test_release_batch_checks_constituents_at_pinned_head(self):
+        api, head, records = self._release_fixture()
+        records[2]['head']['sha'] = 'e' * 40  # A merged PR's source branch can move.
+        log_reader = lambda *_: ci.MODE_MARK + 'full'
+        calls = []
+
+        def merge_stub(idn, number, sha):
+            calls.append((number, sha))
+            api.pr.update(state='closed', merged=True, merge_commit_sha=api.merged_sha)
+
+        options = dict(confirm=True, risk='高', approval='Approved fixed head', api=api,
+                       log_reader=log_reader, merger=merge_stub)
+        with self.assertRaisesRegex(Blocked, '同时改了代码和进度表'):
+            ci.merge(self.s, 'demo', 1, **options)
+        self.assertEqual(calls, [])
+        preview = ci.release_check(self.s, 'demo', 1, head, api, log_reader)
+        self.assertEqual((preview['来源PR'], preview['CI模式']), ([2, 3], 'full'))
+        self.assertEqual(self.s.get(ci.LOG, []), [])
+        result = ci.merge(self.s, 'demo', 1, release_head=head, **options)
+        self.assertEqual((result['来源PR'], calls), ([2, 3], [(1, head)]))
+        self.assertEqual(self.s.get(ci.LOG)[-1]['来源PR'], [2, 3])
+
+    def test_release_batch_keeps_confirm_approval_pin_and_full_ci(self):
+        api, head, _ = self._release_fixture()
+        log_reader = lambda *_: ci.MODE_MARK + 'full'
+        options = dict(confirm=True, risk='高', approval='Approved fixed head',
+                       api=api, release_head=head, log_reader=log_reader,
+                       merger=lambda *args: self.fail('invalid release attempted to merge'))
+        for changed, error in (
+            ({'confirm': False}, '--confirm'),
+            ({'risk': '低'}, '--risk 高'),
+            ({'approval': ''}, '--approval'),
+            ({'release_head': head[:8]}, '完整'),
+            ({'release_head': 'a' * 40}, '头提交'),
+            ({'log_reader': lambda *_: ci.MODE_MARK + 'docs'}, '全量 CI'),
+        ):
+            with self.subTest(error=error), self.assertRaisesRegex(Blocked, error):
+                ci.merge(self.s, 'demo', 1, **(options | changed))
+        api.ci_pr = 2
+        with self.assertRaisesRegex(Blocked, '固定头的成功 CI'):
+            ci.merge(self.s, 'demo', 1, **options)
+        api.statuses = st('success', 'skipped')
+        self.assertEqual(ci.merge(self.s, 'demo', 1, **options)['结论'], '被跳过')
+
+    def test_release_batch_refuses_invalid_provenance_and_moving_base(self):
+        api, head, records = self._release_fixture()
+        log_reader = lambda *_: ci.MODE_MARK + 'full'
+        development = api.development
+        api.development = records[2]['merge_commit_sha']
+        with self.assertRaisesRegex(Blocked, '第一父链'):
+            ci.release_check(self.s, 'demo', 1, head, api, log_reader)
+        api.development = development
+        records[3]['merged'] = False
+        with self.assertRaisesRegex(Blocked, '合并记录'):
+            ci.release_check(self.s, 'demo', 1, head, api, log_reader)
+        records[3]['merged'] = True
+        api.pr['base']['ref'] = 'master'
+        with self.assertRaisesRegex(Blocked, '本仓库 main'):
+            ci.release_check(self.s, 'demo', 1, head, api, log_reader)
+        api.pr['base']['ref'] = 'main'
+        api.release_reads = 0
+        api.move_base = True
+        with self.assertRaisesRegex(Blocked, '目标分支已更新'):
+            ci.release_check(self.s, 'demo', 1, head, api, log_reader)
+
+    def test_release_batch_refuses_mixed_source_pr(self):
+        api, head, _ = self._release_fixture(mixed_source=True)
+        with self.assertRaisesRegex(Blocked, '来源 PR #2'):
+            ci.release_check(self.s, 'demo', 1, head, api, lambda *_: ci.MODE_MARK + 'full')
+
+    def test_release_batch_rename_is_not_the_first_progress_file_exception(self):
+        api, head, _ = self._release_fixture(moved_progress=True)
+        with self.assertRaisesRegex(Blocked, '来源 PR #2'):
+            ci.release_check(self.s, 'demo', 1, head, api, lambda *_: ci.MODE_MARK + 'full')
+
+    def test_release_merge_readback_refuses_unexpected_target_commit(self):
+        api, head, _ = self._release_fixture()
+
+        def merger(idn, number, sha):
+            api.pr.update(state='closed', merged=True, merge_commit_sha=api.merged_sha)
+            api.merged_parents = ['e' * 40, sha]
+
+        with self.assertRaisesRegex(Blocked, '合并父提交与核验时不同'):
+            ci.merge(self.s, 'demo', 1, confirm=True, risk='高', approval='Approved fixed head',
+                     api=api, release_head=head, log_reader=lambda *_: ci.MODE_MARK + 'full', merger=merger)
+        self.assertEqual(self.s.get(ci.LOG, []), [])
+
     def test_merge_not_confirmed_by_readback_is_reported(self):
         with self.assertRaises(Blocked) as e:
             ci.merge(self.s,'demo',1,confirm=True,risk='低',api=FakeApi(pr(),st('success')),merger=lambda *a:None)

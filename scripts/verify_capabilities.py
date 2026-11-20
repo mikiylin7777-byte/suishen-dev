@@ -5,10 +5,14 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+sys.dont_write_bytecode = True
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from portable.core import Store
 from portable.onboarding import check_clients,check_sdk
-sdk=Path(os.environ.get('PORTABLE_SDK_PYTHON',str(Path(__file__).resolve().parents[1]/'.build/integration-sdk/bin/python')))
+from scripts.sdk_cache import sdk_cache_dir
+
+sdk_override = os.environ.get('PORTABLE_SDK_PYTHON')
+sdk = Path(sdk_override) if sdk_override else sdk_cache_dir() / 'integration-sdk/bin/python'
 if not sdk.is_file():raise SystemExit('BLOCKED: select PORTABLE_SDK_PYTHON from a locally rebuilt SDK environment')
 with tempfile.TemporaryDirectory(prefix='portable-capabilities-') as tmp:
     store=Store(Path(tmp).resolve()/'app')

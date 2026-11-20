@@ -7,6 +7,8 @@
 合并按协议【按风险分级】：低风险 CI 通过、高风险用户点头后，由 AI 带 --confirm 执行；合并前当场复查，并把头提交号交给平台，头提交变了就不合。
 """
 import json
+import re
+import subprocess
 import time
 from pathlib import Path
 from urllib.error import HTTPError
@@ -204,7 +206,6 @@ MODE_MARK='随身开发CI模式='
 
 def _read_job_log(idn,link):
     """读 CI 某个 job 的日志原文（Gitea）。读不到返回 None。"""
-    import re
     m=re.search(r'/jobs/(\d+)',link or '')
     if not m or idn.get('platform')=='github':return None
     req=Request(idn['origin']+f"/api/v1/repos/{idn['repo']}/actions/jobs/{m.group(1)}/logs",headers=rp.gitea_headers(idn))
@@ -231,7 +232,6 @@ def check_mixed_progress_pr(files,has_docs_gate=True):
 
 def code_hard_check(store,project_path,expected_sha=None):
     """第一道关：所有电脑 100% 能跑的纯代码硬检查（不依赖任何外部 AI）；传入 expected_sha 时优先从该 Git 提交树读取，防止本地工作区与待合 PR 不一致。"""
-    import subprocess
     root=Path(project_path)
     proto_text=None;actual=None
     if expected_sha and (root/'.git').exists():
@@ -260,27 +260,174 @@ def code_hard_check(store,project_path,expected_sha=None):
             raise Blocked('代码硬检查未通过：运行模块白名单与 portable/ 实际文件不一致')
 
 
-def docs_mode_check(api,idn,result,files,log_reader=None):
+def docs_mode_check(api,idn,result,files,log_reader=None,release_batch=False):
     """合并前再判一次「只改文档」，并和 CI 日志里的模式对账（第 77 题方案甲§3）。返回 (类别, CI 模式)；对不上就 Blocked。"""
     from .ci_docs_only import classify
     mine,_=classify(files)
     kind='文档类' if mine=='docs' else '代码类'
-    if not _repo_has_docs_gate(api,idn,result.get('目标分支') or 'main'):return kind,'未接轻量CI'
-    check_mixed_progress_pr(files,True)
+    if not release_batch:
+        if not _repo_has_docs_gate(api,idn,result.get('目标分支') or 'main'):return kind,'未接轻量CI'
+        check_mixed_progress_pr(files,True)
     reader=log_reader or _read_job_log
     modes=set()
-    import re
     pattern=re.compile(re.escape(MODE_MARK)+r'(docs|full)\b')
     for c in result.get('检查',[]):
         text=reader(idn,c.get('链接')) or ''
         # 只认「=」后面紧跟的 docs/full；日志里回显的命令行（带引号、带 ${{ }}）不算（11-16 验证 PR108/109 发现读成了 full"）
         modes.update(m.group(1) for m in pattern.finditer(text))
     if not modes:raise Blocked('这个仓库已接轻量 CI，但读不到这次 CI 的模式记录（日志里没有「'+MODE_MARK+'」），本次没有合并：CI 可能被改过或日志丢了，要人来看')
+    if release_batch and modes != {'full'}:
+        raise Blocked('发布批次必须在固定头通过全量 CI，本次未核实 full 模式')
     if mine=='full' and modes!={'full'}:raise Blocked('这个 PR 改了文档以外的文件，但 CI 按「只改文档」跑的（'+'、'.join(sorted(modes))+'），全量测试没跑，本次没有合并：CI 判错了或被改过，要人来看')
     return kind,'、'.join(sorted(modes))
 
 
-def merge(store,project,number,confirm=False,wait_first=False,timeout=3600,api=None,merger=None,sleep=time.sleep,clock=time.monotonic,no_run_minutes=10,now=time.time,risk=None,approval='',log_reader=None):
+def _require_release_head(release_head, actual_head=None):
+    if not re.fullmatch(r'[0-9a-f]{40}', release_head):
+        raise Blocked('--release-head 要写完整的 40 位 Git 提交号')
+    if actual_head is not None and release_head != actual_head:
+        raise Blocked('发布批次的头提交和 --release-head 不一致，重新核对批准范围')
+
+
+def _release_snapshot(api, idn, result):
+    pr = _get_pr(api, idn, result['PR'])
+    _require_release_head(result['头提交'], (pr.get('head') or {}).get('sha') or '')
+    base = pr.get('base') or {}
+    base_sha = base.get('sha') or ''
+    if (base.get('ref') != 'main' or base.get('ref') != result['目标分支']
+            or (base.get('repo') or {}).get('full_name') != idn['repo']
+            or not re.fullmatch(r'[0-9a-f]{40}', base_sha)):
+        raise Blocked('无法核实发布批次以本仓库 main 为目标')
+    if pr.get('state') != 'open' or pr.get('merged') or pr.get('draft') or pr.get('mergeable') is not True:
+        raise Blocked('发布 PR 当前必须是开放、非草稿且无冲突的状态')
+    return base_sha
+
+
+def _release_git(path, *args):
+    try:
+        return subprocess.run(
+            ['git', '--no-replace-objects', '-C', str(path), *args],
+            capture_output=True, text=True, encoding='utf-8', errors='surrogateescape',
+            check=True, timeout=30,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        raise Blocked('无法读取发布批次的 Git 历史，请核对本地是否有固定头、目标分支和 development 的完整提交') from None
+
+
+def _release_files(path, parent, head):
+    raw = _release_git(path, 'diff', '--name-status', '-z', '-M', '-l0',
+                       '--ignore-submodules=none', '--no-ext-diff', parent, head, '--')
+    fields = iter(raw.rstrip('\0').split('\0')) if raw else iter(())
+    files = []
+    for status in fields:
+        name = next(fields)
+        if status.startswith('R'):
+            files.append((name, 'renamed', ''))
+            files.append((next(fields), 'renamed', name))
+        else:
+            files.append((name, 'added' if status == 'A' else 'changed', ''))
+    return files
+
+
+def _release_ci_checks(api, idn, result):
+    # A commit can carry statuses from multiple PRs sharing a head. Read mode
+    # only from successful jobs linked to the release PR's own workflow run.
+    job_link = re.compile(
+        rf"(?:{re.escape(idn['origin'])})?/{re.escape(idn['repo'])}/actions/runs/([0-9]+)/jobs/([0-9]+)"
+    )
+    by_run = {}
+    for check_row in result['检查']:
+        match = job_link.fullmatch(check_row['链接'])
+        if match:
+            run_id, job_id = map(int, match.groups())
+            by_run.setdefault(run_id, {})[job_id] = check_row
+
+    verified = []
+    for run_id, checks in by_run.items():
+        endpoint = f"repos/{idn['repo']}/actions/runs/{run_id}"
+        run = api(idn, 'GET', endpoint)
+        if (run.get('head_sha') != result['头提交'] or run.get('event') != 'pull_request'
+                or run.get('status') != 'completed' or run.get('conclusion') != 'success'
+                or not any(pr.get('number') == result['PR'] and (pr.get('base') or {}).get('ref') == 'main'
+                           for pr in run.get('pull_requests') or [])):
+            continue
+        jobs = api(idn, 'GET', endpoint + '/jobs?limit=100')
+        verified.extend(checks[job['id']] for job in jobs.get('jobs') or []
+                        if job.get('id') in checks and job.get('head_sha') == result['头提交']
+                        and job.get('run_id') == run_id and job.get('status') == 'completed'
+                        and job.get('conclusion') == 'success')
+    if not verified:
+        raise Blocked('没有找到绑定这个发布 PR 和固定头的成功 CI 作业')
+    return verified
+
+
+def _verify_release_batch(api, idn, path, result, log_reader=None):
+    if idn['platform'] != 'gitea':
+        raise Blocked('发布批次核验目前需要 Gitea 的合并记录和 CI 作业日志')
+    base = _release_snapshot(api, idn, result)
+    head = result['头提交']
+    branch = api(idn, 'GET', f"repos/{idn['repo']}/branches/development")
+    development = (branch.get('commit') or {}).get('id') or ''
+    if not re.fullmatch(r'[0-9a-f]{40}', development):
+        raise Blocked('无法核实在线 development 分支的提交')
+    merge_bases = _release_git(path, 'merge-base', '--all', base, head).splitlines()
+    if len(merge_bases) != 1:
+        raise Blocked('这个发布批次没有唯一的 Git 共同基线')
+    start = merge_bases[0]
+    if head not in _release_git(path, 'rev-list', '--first-parent', f'{start}..{development}').splitlines():
+        raise Blocked('固定头不在本仓库 development 的第一父链上')
+    commits = _release_git(path, 'rev-list', '--first-parent', '--reverse', '--parents', f'{start}..{head}').splitlines()
+    source_prs = []
+    parent = start
+    for commit_line in commits:
+        commit = commit_line.split()
+        if len(commit) != 3 or commit[1] != parent:
+            raise Blocked('发布批次含未通过普通 PR 合入 development 的提交')
+        sha = commit[0]
+        subject = _release_git(path, 'show', '-s', '--format=%s', sha).strip()
+        match = re.search(r"\(#([1-9][0-9]*)\) from \S+ into development$", subject)
+        if not match or not subject.startswith('Merge pull request '):
+            raise Blocked('无法定位来源 PR，发布批次需要保留带 PR 编号的 Gitea 合并提交')
+        number = int(match.group(1))
+        pr = _get_pr(api, idn, number)
+        target = pr.get('base') or {}
+        if (pr.get('merged') is not True or pr.get('merge_commit_sha') != sha
+                or target.get('ref') != 'development' or (target.get('repo') or {}).get('full_name') != idn['repo']):
+            raise Blocked(f'来源 PR #{number} 的 Gitea 合并记录与 development 不一致')
+        try:
+            check_mixed_progress_pr(_release_files(path, parent, sha))
+        except Blocked as error:
+            raise Blocked(f'来源 PR #{number} 未通过进度表检查：{error}') from None
+        source_prs.append(number)
+        parent = sha
+    if not source_prs or parent != head:
+        raise Blocked('无法核实这个发布批次的完整来源')
+    ci_result = dict(result, **{'检查': _release_ci_checks(api, idn, result)})
+    kind, ci_mode = docs_mode_check(api, idn, ci_result, _release_files(path, start, head), log_reader, release_batch=True)
+    if _release_snapshot(api, idn, result) != base:
+        raise Blocked('核验期间发布的目标分支已更新，请重新核验')
+    return kind, ci_mode, {'发布共同基线': start, '发布目标提交': base, '来源PR': source_prs}
+
+
+def release_check(store, project, number, release_head, api=None, log_reader=None, no_run_minutes=10):
+    """Verify a pinned release without calling the merge endpoint."""
+    _require_release_head(release_head)
+    api = api or rp.api
+    result = check(store, project, number, api, no_run_minutes)
+    _require_release_head(release_head, result['头提交'])
+    if result['结论'] != PASS:
+        return result
+    path = _project(store, project)
+    kind, mode, batch = _verify_release_batch(api, _identity(path), path, result, log_reader)
+    return {**result, **batch, '类别': kind, 'CI模式': mode,
+            '说明': '发布来源和固定头全量 CI 已核验。合并时仍须写明高风险和用户批准出处。'}
+
+
+def merge(store,project,number,confirm=False,wait_first=False,timeout=3600,api=None,merger=None,sleep=time.sleep,clock=time.monotonic,no_run_minutes=10,now=time.time,risk=None,approval='',log_reader=None,release_head=None):
+    if release_head is not None:
+        _require_release_head(release_head)
+        if risk != '高' or not (approval or '').strip():
+            raise Blocked('合并发布批次必须写 --risk 高 和 --approval 用户批准出处')
     if not confirm:raise Blocked('合并要加 --confirm：低风险改动 CI 通过就可以加；高风险通过代码硬检查与独立审查（review --kind 合并）后再加（见【按风险分级】）')
     if risk not in ('低','高'):raise Blocked('合并要写 --risk 低 或 --risk 高（见【按风险分级】）；拿不准就按高')
     from .review import find_merge_receipt
@@ -288,6 +435,8 @@ def merge(store,project,number,confirm=False,wait_first=False,timeout=3600,api=N
         raise Blocked('高风险合并需要先跑 review <项目> --kind 合并 通过独立审查（或写 --approval "<用户点头的原话和出处>"），没有审查通过就不合')
     api=api or rp.api
     result=wait(store,project,number,timeout,api=api,sleep=sleep,clock=clock,no_run_minutes=no_run_minutes,now=now) if wait_first else check(store,project,number,api,no_run_minutes,now)
+    if release_head is not None:
+        _require_release_head(release_head, result['头提交'])
     if result['结论']!=PASS:
         result['已合并']=result['结论']=='已合并';result['本次合并']=False
         return result
@@ -307,19 +456,38 @@ def merge(store,project,number,confirm=False,wait_first=False,timeout=3600,api=N
         files=_changed_files(api,idn,number)
         reasons=high_risk_reasons(files)
         if reasons:raise Blocked('这个 PR 不是低风险（'+'；'.join(reasons[:5])+'），本次没有合并：给用户看过、用户点头后用 --risk 高 --approval "<原话和出处>" 再合')
-    if risk!='低':files=_changed_files(api,idn,number)
-    kind,ci_mode=docs_mode_check(api,idn,result,files,log_reader)
+    batch = {}
+    if release_head is not None:
+        kind, ci_mode, batch = _verify_release_batch(api, idn, proj_path, result, log_reader)
+    else:
+        if risk!='低':files=_changed_files(api,idn,number)
+        kind,ci_mode=docs_mode_check(api,idn,result,files,log_reader)
     if merger:merger(idn,number,sha)
     elif idn['platform']=='github':_merge_github(api,idn,number,sha)
     else:_merge_gitea(idn,number,sha)
     after=api(idn,'GET',f"repos/{idn['repo']}/pulls/{int(number)}")
     if not after.get('merged'):raise Blocked('合并请求已发出，但读回 PR 还没显示已合并；先 ci check 再看，不要直接重发')
+    if batch:
+        # Gitea's merge API can pin the source head only. Check the actual
+        # target and both merge parents before recording release success.
+        merged_sha = after.get('merge_commit_sha') or ''
+        if not re.fullmatch(r'[0-9a-f]{40}', merged_sha):
+            raise Blocked('Gitea 已显示发布 PR 已合并，但读不到合并提交。请核查，别重发')
+        try:
+            merged = api(idn, 'GET', f"repos/{idn['repo']}/git/commits/{merged_sha}")
+        except rp.DeliveryError:
+            raise Blocked('Gitea 已显示发布 PR 已合并，但读不到合并父提交。请核查，别重发') from None
+        parents = [p.get('sha') for p in merged.get('parents') or []]
+        if (after.get('base') or {}).get('ref') != 'main' or parents != [batch['发布目标提交'], sha]:
+            raise Blocked('Gitea 已显示发布 PR 已合并，但目标分支或合并父提交与核验时不同。请核查，别重发')
     record={'时间':time.strftime('%Y-%m-%d %H:%M:%S'),'仓库':idn['repo'],'PR':int(number),'头提交':sha,
             '合并提交':after.get('merge_commit_sha') or after.get('merged_commit_id') or '','检查':[c['名称']+'='+c['结果'] for c in result['检查']],
             '风险':risk,'用户点头':(approval or '').strip(),'类别':kind,'CI模式':ci_mode}
+    record.update(batch)
     store.put(LOG,(store.get(LOG,[])+[record])[-200:])
     out=dict(result,**{'本次合并':True,'已合并':True,'合并提交':record['合并提交'],'说明':'检查全部通过，已合并并读回确认。','类别':kind,'CI模式':ci_mode})
-    if kind=='代码类':out['提醒']='记得另开文档 PR 更新 STATUS.md、功能清单.md（见【收工必写】）'
+    out.update(batch)
+    if kind=='代码类' and not batch:out['提醒']='记得另开文档 PR 更新 STATUS.md、功能清单.md（见【收工必写】）'
     return out
 
 
@@ -328,9 +496,12 @@ def run(args):
     s=Store(args.root)
     try:
         n=args.no_run_minutes
-        if args.action=='check':return check(s,args.project,args.pr,no_run_minutes=n)
+        if args.action=='check':
+            if args.release_head is not None:
+                return release_check(s,args.project,args.pr,args.release_head,no_run_minutes=n)
+            return check(s,args.project,args.pr,no_run_minutes=n)
         if args.action=='wait':return wait(s,args.project,args.pr,args.timeout,no_run_minutes=n)
-        if args.action=='merge':return merge(s,args.project,args.pr,args.confirm,args.wait,args.timeout,no_run_minutes=n,risk=args.risk,approval=args.approval or '')
+        if args.action=='merge':return merge(s,args.project,args.pr,args.confirm,args.wait,args.timeout,no_run_minutes=n,risk=args.risk,approval=args.approval or '',release_head=args.release_head)
         return {'合并记录':s.get(LOG,[])[-20:]}
     finally:s.db.close()
 
@@ -344,12 +515,15 @@ def register(subparser):
     p.add_argument('--confirm',action='store_true',help='可以合：低风险 CI 通过，或高风险用户已点头')
     p.add_argument('--risk',choices=['低','高'],help='merge 必填：按【按风险分级】判的档；低风险时程序会再查改动文件，碰 CI、规矩、合并把关或删测试的不让按低风险合')
     p.add_argument('--approval',help='高风险必填：用户点头的原话和出处')
+    p.add_argument('--release-head',help='Gitea 发布批次固定头（完整 SHA）；check 核验来源与全量 CI，merge 还须 --risk 高 --approval')
     p.add_argument('--no-run-minutes',type=int,default=10,help='从第一次查到没有任何检查起，超过几分钟就报「CI 没触发」，默认 10')
     p.set_defaults(ci_run=_checked(run));return p
 
 
 def _checked(fn):
     def inner(args):
+        if args.release_head is not None and args.action not in ('check', 'merge'):
+            raise Blocked('--release-head 仅用于 ci check 或 ci merge')
         if args.action!='log' and (not args.project or args.pr is None):raise Blocked('要写项目和 PR 号：ci '+args.action+' <项目> <PR号>')
         return fn(args)
     return inner
