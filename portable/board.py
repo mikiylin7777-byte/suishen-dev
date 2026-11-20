@@ -6,6 +6,7 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -370,6 +371,17 @@ def _learned(entry):
         except OSError:continue
     return found
 
+def _installation_problem(root):
+    from .distribution import RUNTIME, release_verify
+    if not (root/'发行.json').exists() and not (root/RUNTIME).exists():
+        return None
+    try:
+        release_verify(root)
+    except Exception as error:
+        return str(error)
+    return None
+
+
 def backup_reminders(store,now=None):
     """只读保护状态；没有证据时不把备份当成已完成。"""
     from .supervisor import service
@@ -393,12 +405,6 @@ def backup_reminders(store,now=None):
             reminders.insert(0,f'后台处于暂停，什么都不做（谁停的：{why.get("by") or "未写明"}；{when}；原因：{why.get("reason") or "未写明"}）：不是你让停的就说「帮我恢复后台」')
         else:  # 没记原因：多半是换了电脑或挪了位置，为防两台电脑重复干活先停下（2026-11-16 U 盘实测）
             reminders.insert(0,'后台处于暂停，什么都不做（没记原因，常见于换了电脑或挪了位置：为防两台电脑重复干活先停下）：换了电脑就说「我换电脑了，把项目接回来」，否则说「帮我恢复后台」')
-    if (store.root/'发行.json').is_file():
-        try:
-            from .distribution import release_verify
-            release_verify(store.root)
-        except Exception as e:
-            reminders.insert(0,'安装目录文件被手改过（'+str(e)+'）：不许在安装目录手改代码或协议，请用 upgrade apply 重新安装或退回上一版')
     from .wizard import risky_location
     try:place=risky_location(store.root)
     except Exception:place=''
@@ -424,6 +430,9 @@ def backup_reminders(store,now=None):
     auto=store.get('runner:auto-resumed') or {}
     if auto.get('at') and now-auto['at']<7*86400:
         reminders.append('后台曾因旧版关机留下的暂停而停住，开机时已自动恢复')
+    issue=_installation_problem(store.root)
+    if issue:
+        reminders.insert(0,'安装目录文件被手改过（'+issue+'）：不许在安装目录手改代码或协议，请用 upgrade apply 重新安装或退回上一版')
     return reminders
 
 def overview(store,sync=False,today=None):
@@ -707,7 +716,7 @@ def write_board(store,entries,page,traps):
     return {'board':str(folder),'written':done}
 
 def board_fingerprint(store):
-    parts=[]
+    parts=[_installation_problem(store.root) or '']
     for e in load(store):
         e=_pitfalls_entry(e)
         for key in SYNC_NAMES:
@@ -1046,6 +1055,9 @@ def docs_gate_drift(entry):
 
 MAX_RECENT_UPDATES=20
 MAX_AGENTS_LINES=40
+AGENTS_PROTOCOL_REF=re.compile(r'(?<![a-zA-Z0-9_.-])(?:开发协议\.md|工具/协议\.json|portable/protocol\.json)(?![a-zA-Z0-9_.-])')
+AGENTS_STATUS_REF=re.compile(r'(?<![a-zA-Z0-9_.-])STATUS\.md(?![a-zA-Z0-9_.-])')
+
 
 def count_recent_updates(text):
     """数 STATUS.md 里「## 近期动态」下的顶层条目数（以 '- ' 开头、无前导缩进的行）。"""
@@ -1166,6 +1178,9 @@ def weekly_check(store,today=None,tasks=None):
         if agents_f.is_file() and not (root_p/'发行.json').is_file():
             try:
                 alines=agents_f.read_text(encoding='utf-8',errors='replace').splitlines()
+                first_line=alines[0] if alines else ''
+                if not (AGENTS_PROTOCOL_REF.search(first_line) and AGENTS_STATUS_REF.search(first_line)):
+                    found.append((e['name']+':agents-first-line:'+week,f'{e["name"]}：AGENTS.md 首行需要同时指向开发协议和 STATUS.md'))
                 if len(alines)>MAX_AGENTS_LINES:
                     found.append((e['name']+':agents-lines:'+week,f'{e["name"]}：AGENTS.md 有 {len(alines)} 行（规矩上限 {MAX_AGENTS_LINES} 行），请精简到 {MAX_AGENTS_LINES} 行以内'))
             except OSError:pass

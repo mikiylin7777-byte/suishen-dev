@@ -19,6 +19,7 @@ from .core import Blocked, Store
 STATE_PREFIX = 'test_gate:'
 MAX_FULL_PER_BATCH = 2
 DEFAULT_LOCK = Path(tempfile.gettempdir()) / 'suishen-dev-full-test.lock'
+RESUMABLE_STAGES = ('python', 'bots', 'bot-sdk', 'capabilities')
 
 CORE_RULES = (
     ('billing', re.compile(r'(?:^|/|_)('
@@ -28,16 +29,18 @@ CORE_RULES = (
                         r'auth|authn|authz|perm|permission|role|rbac|acl|token|login|session_auth|privacy|sensitive|security'
                         r')(?:$|/|_|\.)', re.I)),
     ('workflow', re.compile(r'(?:^|/|_)('
-                            r'workflow|state_machine|lifecycle|status_flow|taskline|orchestrat|approval_flow|pipeline'
+                            r'workflows?|state_machine|lifecycle|status_flow|taskline|orchestration|approval_flow|pipeline'
                             r')(?:$|/|_|\.)', re.I)),
     ('schema', re.compile(r'(?:^|/|_)(schema|migrat\w*|models|database|db_adapters|ddl)(?:$|/|_|\.)|\.sql$', re.I)),
     ('shell', re.compile(r'(?:^|/)(__main__\.py|core\.py|protocol\.json|distribution\.py|ci\.py|App\.[jt]sx?|layout\.[jt]sx?|router\.[jt]sx?|shell\.[jt]sx?)$', re.I)),
+    ('test gate', re.compile(r'^(?:scripts/(?:verify\.sh|prepare_test_env\.sh|sdk_cache\.py|mcp-sdk\.lock\.txt)|portable/test_gate\.py)$')),
 )
 
 
 def _git(repo, *args, timeout=30):
-    r = subprocess.run(['git', '-C', str(repo), '-c', 'core.quotepath=off', *args],
-                       capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(['git', '--no-replace-objects', '-C', str(repo), '-c', 'core.quotepath=off', *args],
+                       capture_output=True, text=True, timeout=timeout,
+                       env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
@@ -55,30 +58,66 @@ def touches_core(files):
     return hits
 
 
-def _trunk_ref(repo, git=_git):
+def _cached_trunk_ref(repo, git):
     from .board import REMOTE_DEV, REMOTE_MAIN
-    for ref in (*REMOTE_DEV, *REMOTE_MAIN, 'refs/heads/development', 'refs/heads/main'):
+    for ref in (*REMOTE_DEV, *REMOTE_MAIN):
         code, sha, _ = git(repo, 'rev-parse', '-q', '--verify', ref + '^{commit}')
         if code == 0 and sha:
             return ref, sha
     return None, ''
 
 
-def check_trunk_synced(repo, git=_git):
-    """Verify HEAD includes the latest trunk commit. Non-git or single-branch repos pass."""
-    repo = Path(repo)
+def _remote_trunk(repo, git):
     if not (repo / '.git').exists():
-        return True, None, ''
-    ref, trunk_sha = _trunk_ref(repo, git)
-    if not ref or not trunk_sha:
-        return True, None, ''
-    code, head_sha, _ = git(repo, 'rev-parse', '-q', '--verify', 'HEAD^{commit}')
-    if code != 0 or not head_sha:
-        return True, ref, trunk_sha
-    if head_sha == trunk_sha:
-        return True, ref, trunk_sha
-    anc_code, _, _ = git(repo, 'merge-base', '--is-ancestor', trunk_sha, 'HEAD')
-    return anc_code == 0, ref, trunk_sha
+        return None, ''
+    code, out, _ = git(repo, 'remote')
+    if code:
+        raise Blocked('无法读取 Git 远端配置')
+    remotes = out.splitlines()
+    if not remotes:
+        return None, ''
+    remote = next((name for name in ('gitea', 'origin') if name in remotes), None)
+    if remote is None:
+        if len(remotes) != 1:
+            raise Blocked('有多个 Git 远端，无法确定主干来源：请核对远端配置')
+        remote = remotes[0]
+
+    branches = ('refs/heads/development', 'refs/heads/main', 'refs/heads/master')
+    try:
+        code, out, _ = git(repo, 'ls-remote', '--symref', '--', remote, 'HEAD', *branches, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        code, out = 1, ''
+    refs = {}
+    default_ref = ''
+    if code == 0:
+        for line in out.splitlines():
+            value, _, ref = line.partition('\t')
+            if ref == 'HEAD' and value.startswith('ref: refs/heads/'):
+                default_ref = value.removeprefix('ref: ')
+            elif ref in (*branches, 'HEAD') and re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', value):
+                refs[ref] = value
+    for ref in branches:
+        if ref in refs:
+            return remote + '/' + ref.removeprefix('refs/heads/'), refs[ref]
+    if default_ref and 'HEAD' in refs:
+        return remote + '/' + default_ref.removeprefix('refs/heads/'), refs['HEAD']
+    raise Blocked(f'无法核实 {remote} 的最新主干：请检查连接及远端默认分支')
+
+
+def _test_revision(repo, git, require_sync, last):
+    if not (repo / '.git').exists():
+        return None, '', ''
+    _, head_sha, _ = git(repo, 'rev-parse', '-q', '--verify', 'HEAD^{commit}')
+    if not require_sync:
+        if 'trunk_sha' in last:
+            return last.get('trunk_ref'), last['trunk_sha'], head_sha
+        return (*_cached_trunk_ref(repo, git), head_sha)
+    ref, trunk_sha = _remote_trunk(repo, git)
+    if trunk_sha and trunk_sha != head_sha:
+        code, _, _ = git(repo, 'merge-base', '--is-ancestor', trunk_sha, head_sha)
+        if code:
+            raise Blocked(f'主干 {ref} 有新改动尚未合入当前分支：先同步主干再跑全量')
+    return ref, trunk_sha, head_sha
 
 
 def _changed_since(repo, since_sha, git=_git):
@@ -194,84 +233,108 @@ def _resolve_project(store, project):
 def plan_run(store, project, *, force_full=False, require_sync=True, changed_files=None, git=_git):
     """Decide whether to run 'full' or 'partial', or block on unsynced trunk / >2 full runs."""
     pid, name, repo = _resolve_project(store, project)
-    synced, trunk_ref, trunk_sha = check_trunk_synced(repo, git)
-    if require_sync and not synced:
-        raise Blocked(f'主干 {trunk_ref} 有新改动尚未合入当前分支：先同步主干再跑全量')
-    _, head_sha, _ = git(repo, 'rev-parse', '-q', '--verify', 'HEAD^{commit}')
     key = STATE_PREFIX + pid
     last = dict(store.get(key) or {})
-    new_trunk = bool(trunk_sha and last.get('trunk_sha') and last.get('trunk_sha') != trunk_sha)
+    trunk_ref, trunk_sha, head_sha = _test_revision(repo, git, require_sync, last)
+    state_version = int(last.get('state_version') or 0)
+    new_trunk = bool(trunk_sha and 'trunk_sha' in last and last['trunk_sha'] != trunk_sha)
     if new_trunk:
         last = {'trunk_sha': trunk_sha, 'full_runs': 0, 'failed_tests': [], 'head_sha': head_sha}
     patch_files = list(changed_files) if changed_files is not None else _changed_since(repo, last.get('head_sha') or '', git)
     core_hits = touches_core(patch_files)
     failed = [t for t in (last.get('failed_tests') or ()) if t and t.startswith('tests.test_')]
+    resume_stage = last.get('resume_stage')
+    if resume_stage not in RESUMABLE_STAGES:
+        resume_stage = None
     full_runs = int(last.get('full_runs') or 0)
+    plan = {
+        'project': name,
+        'full_runs': full_runs,
+        'trunk': trunk_ref or 'local',
+        'trunk_sha': trunk_sha,
+        'head_sha': head_sha,
+    }
 
-    if failed and not new_trunk and not core_hits and not force_full:
+    if (failed or resume_stage) and not new_trunk and not core_hits and not force_full:
         targets = affected_tests(repo, failed, patch_files)
-        if targets:
+        if resume_stage and targets:
+            resume_stage = 'python'
+        elif resume_stage and any(
+            path.startswith('adapters/bots/') and path != 'adapters/bots/sdk-smoke.mjs' for path in patch_files
+        ):
+            resume_stage = 'bots'
+        elif resume_stage == 'capabilities' and 'adapters/bots/sdk-smoke.mjs' in patch_files:
+            resume_stage = 'bot-sdk'
+        if targets or resume_stage:
             return {
-                'project': name,
+                **plan,
                 'mode': 'partial',
                 'targets': targets,
+                'resume_stage': resume_stage,
+                'state_version': state_version,
                 'failed_tests': failed,
                 'changed_files': patch_files,
                 'core_hits': [],
-                'full_runs': full_runs,
-                'trunk': trunk_ref or 'local',
             }
 
     if full_runs >= MAX_FULL_PER_BATCH and not new_trunk:
-        hint = ', '.join(failed) if failed else 'failed modules'
+        hint = ', '.join(failed) if failed else resume_stage or '未识别到具体失败项'
         raise Blocked(f'这一批全量测试已连续跑满 {full_runs} 次（一批最多两次）：请只单跑失败项（{hint}）或用 review {name} --kind 卡住')
 
     return {
-        'project': name,
+        **plan,
         'mode': 'full',
         'targets': ['full'],
         'core_hits': core_hits,
-        'full_runs': full_runs,
-        'trunk': trunk_ref or 'local',
     }
 
 
-def record_run(store, project, mode, passed, failed_tests=(), *, git=_git):
+def record_run(store, project, mode, passed, failed_tests=(), *, plan=None, resume_stage=None, require_sync=True, git=_git):
     """Record a full or partial test execution result."""
     pid, name, repo = _resolve_project(store, project)
-    _, trunk_ref, trunk_sha = check_trunk_synced(repo, git)
-    _, head_sha, _ = git(repo, 'rev-parse', '-q', '--verify', 'HEAD^{commit}')
     key = STATE_PREFIX + pid
-    last = dict(store.get(key) or {})
-    if trunk_sha and last.get('trunk_sha') and last.get('trunk_sha') != trunk_sha:
-        last = {}
-    full_runs = int(last.get('full_runs') or 0)
-    if passed:
-        full_runs = 0
-    elif mode == 'full':
-        full_runs = full_runs + 1
-    state = {
-        'project': name,
-        'trunk_ref': trunk_ref,
-        'trunk_sha': trunk_sha,
-        'head_sha': head_sha,
-        'last_mode': mode,
-        'passed': bool(passed),
-        'failed_tests': [] if passed else [t for t in (failed_tests or ()) if t],
-        'full_runs': full_runs,
-        'at': int(time.time()),
-    }
-    store.put(key, state)
+    if plan is None:
+        trunk_ref, trunk_sha, head_sha = _test_revision(repo, git, require_sync, store.get(key) or {})
+    else:
+        trunk_ref = plan['trunk'] if plan['trunk_sha'] else None
+        trunk_sha, head_sha = plan['trunk_sha'], plan['head_sha']
+    with store.db:
+        last = store.get(key) or {}
+        version = int(last.get('state_version') or 0)
+        if mode == 'partial' and plan is not None and version != plan['state_version']:
+            raise Blocked('局部测试期间已有更新的测试结果：请重新运行守门，按最新结果续跑')
+        full_runs = int(last.get('full_runs') or 0)
+        if passed or (trunk_sha and 'trunk_sha' in last and last['trunk_sha'] != trunk_sha):
+            full_runs = 0
+        if not passed and mode == 'full' and resume_stage != 'setup':
+            full_runs += 1
+        state = {
+            'project': name,
+            'trunk_ref': trunk_ref,
+            'trunk_sha': trunk_sha,
+            'head_sha': head_sha,
+            'last_mode': mode,
+            'passed': bool(passed),
+            'failed_tests': [] if passed else [t for t in (failed_tests or ()) if t],
+            'resume_stage': None if passed else resume_stage,
+            'full_runs': full_runs,
+            'state_version': version + 1,
+            'at': int(time.time()),
+        }
+        store.put(key, state)
     return state
 
 
 def _extract_failed_modules(output):
     found = []
-    for m in re.finditer(r'(?:FAIL|ERROR):\s+\w+\s+\(([\w.]+)\)', output or ''):
+    for m in re.finditer(r'^(?:FAIL|ERROR):[ \t]+\w+[ \t]+\(([\w.]+)\)', output or '', re.MULTILINE):
         parts = m.group(1).split('.')
-        mod = '.'.join(parts[:2]) if len(parts) >= 2 and parts[0] == 'tests' else parts[0]
-        if mod.startswith('tests.test_') and mod not in found:
-            found.append(mod)
+        # unittest discover -s tests reports test_foo, while a partial run
+        # imports the module using its tests.test_foo name.
+        module = parts[1] if len(parts) >= 2 and parts[0] == 'tests' else parts[0]
+        target = f'tests.{module}'
+        if module.startswith('test_') and target not in found:
+            found.append(target)
     return found
 
 
@@ -281,35 +344,78 @@ def verify_entry(repo, *, store_root=None, runner=None, lock_path=None):
     store_dir = Path(store_root or os.environ.get('PORTABLE_GATE_ROOT') or (Path(tempfile.gettempdir()) / 'suishen-dev-test-gate-store'))
     s = Store(store_dir)
     try:
-        plan = plan_run(s, str(repo), force_full=bool(os.environ.get('PORTABLE_FORCE_FULL')),
-                        require_sync=not bool(os.environ.get('PORTABLE_NO_SYNC_CHECK')))
-        if plan['mode'] == 'partial':
-            targets = plan['targets']
+        options = {
+            'force_full': bool(os.environ.get('PORTABLE_FORCE_FULL')),
+            'require_sync': not bool(os.environ.get('PORTABLE_NO_SYNC_CHECK')),
+        }
+        plan = plan_run(s, str(repo), **options)
+        if plan['mode'] == 'full':
+            with FullTestLock(project=repo.name, lock_path=lock_path, wait=True):
+                # An earlier request may have spent the last full run or found partial targets.
+                plan = plan_run(s, str(repo), **options)
+                if plan['mode'] == 'full':
+                    rc, failed, stage = _run_verification(repo, runner)
+                    record_run(s, str(repo), 'full', rc == 0, failed, plan=plan, resume_stage=stage)
+                    return rc, plan
+        targets = plan['targets']
+        stage = plan['resume_stage']
+        if stage:
+            rc, failed, stage = _run_verification(repo, runner, stage=stage, targets=targets)
+        else:
             cmd = [sys.executable, '-m', 'unittest', '-v', *targets]
-            rc, out = (runner(cmd, repo) if runner else _run_streaming(cmd, repo))
-            failed = _extract_failed_modules(out) or (targets if rc != 0 else [])
-            record_run(s, str(repo), 'partial', rc == 0, failed)
-            return rc, plan
-        with FullTestLock(project=repo.name, lock_path=lock_path, wait=True):
-            cmd = ['bash', 'scripts/verify.sh', '--raw']
-            rc, out = (runner(cmd, repo) if runner else _run_streaming(cmd, repo))
-            failed = _extract_failed_modules(out)
-            record_run(s, str(repo), 'full', rc == 0, failed)
-            return rc, plan
+            rc, out = runner(cmd, repo) if runner else _run_streaming(cmd, repo, add_test_directory=True)
+            failed = (_extract_failed_modules(out) or targets) if rc else []
+        record_run(s, str(repo), 'partial', rc == 0, failed, plan=plan, resume_stage=stage)
+        return rc, plan
     finally:
         s.db.close()
 
 
-def _run_streaming(cmd, cwd):
+def _run_verification(repo, runner, *, stage=None, targets=()):
+    cmd = ['bash', 'scripts/verify.sh', '--raw']
+    if stage:
+        cmd.extend(['--resume-from', stage, *targets])
+    started = ''
+    if runner:
+        rc, out = runner(cmd, repo)
+    else:
+        with tempfile.TemporaryDirectory(prefix='portable-verify-') as directory:
+            marker = Path(directory) / 'stage'
+            rc, out = _run_streaming(cmd, repo, stage_file=marker)
+            if marker.is_file():
+                started = marker.read_text(encoding='utf-8').strip()
+    if not rc:
+        return rc, [], None
+    if started == 'setup':
+        # No test ran. Preserve a pending resume and leave the full-run budget intact.
+        return rc, list(targets), stage or 'setup'
+    failed = _extract_failed_modules(out) if started in ('', 'python') else []
+    if started == 'python':
+        failed = failed or list(targets)
+    resume_stage = started if started in RESUMABLE_STAGES else None
+    if not started and stage:
+        resume_stage = stage
+        failed = failed or list(targets)
+    if resume_stage == 'python' and not failed:
+        resume_stage = None
+    return rc, failed, resume_stage
+
+
+def _run_streaming(cmd, cwd, *, add_test_directory=False, stage_file=None):
     import sys
     env = dict(os.environ, PORTABLE_FULL_LOCK_HELD='1')
-    proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if stage_file is not None:
+        env['PORTABLE_VERIFY_STAGE_FILE'] = str(stage_file)
+    if add_test_directory:
+        # Match discovery's sibling import path for tests that import helpers.
+        paths = (str(cwd / 'tests'), env.get('PYTHONPATH'))
+        env['PYTHONPATH'] = os.pathsep.join(path for path in paths if path)
     captured = []
-    for line in proc.stdout:
-        sys.stdout.write(line)
-        sys.stdout.flush()
-        captured.append(line)
-    proc.wait()
+    with subprocess.Popen(cmd, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            captured.append(line)
     return proc.returncode, ''.join(captured)
 
 
@@ -320,7 +426,7 @@ def run(args):
             return plan_run(s, args.project, force_full=args.force_full, require_sync=not args.no_sync_check)
         if args.action == 'record':
             failed = [x.strip() for x in (args.failed or '').split(',') if x.strip()]
-            return record_run(s, args.project, args.mode, args.passed, failed)
+            return record_run(s, args.project, args.mode, args.passed, failed, require_sync=not args.no_sync_check)
         if args.action == 'status':
             pid, name, _ = _resolve_project(s, args.project)
             return s.get(STATE_PREFIX + pid) or {'project': name, 'status': 'empty'}

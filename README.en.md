@@ -23,7 +23,8 @@ Requirements: macOS, Python 3.9+.
 3. Double-click `开始使用.command` and answer a few setup questions.
 
 ## Upgrade & Rollback
-Tell your AI: "把随身开发升级到最新版" (`python3 ~/随身开发/工具/portable.pyz --root ~/随身开发 upgrade apply`), which checks GitHub Releases, verifies the SHA256 digest and upgrades in place. Say "退回上一版" (`upgrade rollback`) to roll back.
+To upgrade from 0.2.58 to 0.2.59, ask your AI to download the new ZIP from [Releases](https://github.com/mikiylin7777-byte/suishen-dev/releases), verify the published SHA256, and extract it. The old installer rejects the new manifest. Run the extracted package's `工具/portable.pyz` with `--root <existing installation> upgrade apply <extracted new package>` to keep your data and settings. Use the installed program's `upgrade rollback` command to go back.
+
 
 ## Develop
 ```bash

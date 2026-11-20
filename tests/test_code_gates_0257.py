@@ -5,7 +5,11 @@
 """
 import json
 import os
+import select
+import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -126,21 +130,35 @@ class CodeGates0257Test(unittest.TestCase):
 
     # —— 第二块：全量测试守门（主干同步、单全量排队锁、局部 vs 核心升全量、两次熔断） ——
 
+    def _use_local_remote(self):
+        remote = self.t / 'remote.git'
+        _git(self.t, 'init', '-q', '--bare', '-b', 'main', str(remote))
+        _git(self.repo, 'remote', 'set-url', 'origin', str(remote))
+        _git(self.repo, 'push', '-q', 'origin', 'main')
+        return remote
+
     def test_test_gate_requires_trunk_sync_and_limits_one_full_at_a_time(self):
+        remote = self._use_local_remote()
+        cached_main = test_gate._git(self.repo, 'rev-parse', 'origin/main')[1]
         # 主干领先当前分支时：要求先同步主干
         _git(self.repo, 'switch', '-q', 'main')
         (self.repo / 'src/other.py').write_text('y = 1\n')
         _git(self.repo, 'add', '.')
         _git(self.repo, 'commit', '-qm', 'trunk-ahead')
-        _git(self.repo, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+        _git(self.repo, 'push', '-q', str(remote), 'main')
         _git(self.repo, 'switch', '-q', 'feat')
-        with self.assertRaisesRegex(Blocked, '先同步主干'):
+        self.assertEqual(test_gate._git(self.repo, 'rev-parse', 'origin/main')[1], cached_main)
+        with self.assertRaisesRegex(Blocked, 'origin/main.*先同步主干'):
             test_gate.plan_run(self.s, 'demo')
 
         # 同步主干后：放行
         _git(self.repo, 'merge', '-q', 'main')
         plan = test_gate.plan_run(self.s, 'demo')
         self.assertEqual(plan['mode'], 'full')
+        self.assertNotEqual(plan['trunk_sha'], cached_main)
+        test_gate.record_run(self.s, 'demo', 'full', passed=False, plan=plan)
+        offline = test_gate.plan_run(self.s, 'demo', require_sync=False)
+        self.assertEqual((offline['trunk_sha'], offline['full_runs']), (plan['trunk_sha'], 1))
 
         # 本机同一时间只跑一个全量锁
         lock_file = self.t / 'full.lock'
@@ -149,7 +167,18 @@ class CodeGates0257Test(unittest.TestCase):
                 with test_gate.FullTestLock('项目乙', lock_path=lock_file, wait=False):
                     pass
 
+    def test_test_gate_skips_local_only_and_blocks_unreachable_remote(self):
+        _git(self.repo, 'remote', 'remove', 'origin')
+        _git(self.repo, 'switch', '-q', 'main')
+        _git(self.repo, 'commit', '-qm', 'local only', '--allow-empty')
+        _git(self.repo, 'switch', '-q', 'feat')
+        self.assertEqual(test_gate.plan_run(self.s, 'demo')['trunk'], 'local')
+        _git(self.repo, 'remote', 'add', 'origin', str(self.t / 'absent.git'))
+        with self.assertRaisesRegex(Blocked, '无法核实 origin 的最新主干'):
+            test_gate.plan_run(self.s, 'demo')
+
     def test_test_gate_partial_on_normal_fix_full_on_core_and_max_two_full_runs(self):
+        self._use_local_remote()
         # 第一次全量挂了 test_nudge
         test_gate.record_run(self.s, 'demo', 'full', passed=False, failed_tests=['tests.test_nudge'])
 
@@ -184,6 +213,7 @@ class CodeGates0257Test(unittest.TestCase):
         self.assertEqual(next_plan['mode'], 'full')
 
     def test_verify_entry_runs_full_then_partial_then_resets(self):
+        self._use_local_remote()
         gate_store = self.t / 'gate-store'
         lock_file = self.t / 'verify.lock'
         ran = []
@@ -197,6 +227,172 @@ class CodeGates0257Test(unittest.TestCase):
         rc2, plan2 = test_gate.verify_entry(self.repo, store_root=gate_store, runner=fake_runner, lock_path=lock_file)
         self.assertEqual((rc2, plan2['mode']), (0, 'partial'))
         self.assertIn('tests.test_nudge', ran[1])
+
+    def test_partial_result_does_not_overwrite_a_newer_failure(self):
+        self._use_local_remote()
+        test_gate.record_run(self.s, 'demo', 'full', passed=False, failed_tests=['tests.test_nudge'])
+
+        def finish_after_new_full_failure(cmd, cwd):
+            test_gate.record_run(self.s, 'demo', 'full', passed=False, failed_tests=['tests.test_new'])
+            return 0, 'OK\n'
+
+        with self.assertRaisesRegex(Blocked, '已有更新的测试结果'):
+            test_gate.verify_entry(self.repo, store_root=self.t / 'root', runner=finish_after_new_full_failure)
+        state = self.s.get(test_gate.STATE_PREFIX + 'demo')
+        self.assertFalse(state['passed'])
+        self.assertEqual((state['failed_tests'], state['full_runs']), (['tests.test_new'], 2))
+
+    def test_verify_entry_reruns_real_unittest_discovery_failure(self):
+        self._use_local_remote()
+        scripts=self.repo/'scripts'
+        scripts.mkdir()
+        (scripts/'verify.sh').write_text(f'{shlex.quote(sys.executable)} -m unittest discover -s tests -v\n')
+        tests=self.repo/'tests'
+        tests.mkdir()
+        (tests/'probe_helper.py').write_text('def check(value):\n    return value\n')
+        test_file=tests/'test_probe.py'
+        template='import unittest\nfrom probe_helper import check\n\nclass Probe(unittest.TestCase):\n    def test_example(self):\n        self.assertTrue(check({}))\n'
+        test_file.write_text(template.format('False'))
+        _git(self.repo,'add','.')
+        _git(self.repo,'commit','-qm','fixture with a failing test')
+        gate_store=self.t/'real-gate-store'
+        lock_file=self.t/'real-verify.lock'
+        rc, plan=test_gate.verify_entry(self.repo,store_root=gate_store,lock_path=lock_file)
+        self.assertEqual((rc,plan['mode']),(1,'full'))
+
+        test_file.write_text(template.format('True'))
+        _git(self.repo,'commit','-qam','fix the test fixture')
+        rc, plan=test_gate.verify_entry(self.repo,store_root=gate_store,lock_path=lock_file)
+        self.assertEqual((rc,plan['mode'],plan['targets']),(0,'partial',['tests.test_probe']))
+        detail='AssertionError: fixture contains ERROR: test_example (test_other.Probe.test_example)'
+        self.assertEqual(test_gate._extract_failed_modules(detail),[])
+
+    def test_waiting_processes_share_the_last_full_run(self):
+        self._use_local_remote()
+        scripts = self.repo / 'scripts'
+        scripts.mkdir()
+        (scripts / 'verify.sh').write_text("echo full >> full-runs.log\nexit 1\n")
+        root = self.t / 'root'
+        lock_file = self.t / 'verify.lock'
+        test_gate.record_run(self.s, 'demo', 'full', passed=False)
+        # Each process signals after making its initial plan and just before waiting.
+        entry = """
+import sys
+from portable import test_gate
+from portable.core import Blocked
+
+class SignallingLock(test_gate.FullTestLock):
+    def __enter__(self):
+        print('queued', flush=True)
+        return super().__enter__()
+
+test_gate.FullTestLock = SignallingLock
+repo, root, lock = sys.argv[1:]
+try:
+    rc, _ = test_gate.verify_entry(repo, store_root=root, lock_path=lock)
+    sys.exit(rc)
+except Blocked as exc:
+    print(exc)
+    sys.exit(2)
+"""
+        processes = []
+        try:
+            with test_gate.FullTestLock(lock_path=lock_file):
+                for _ in range(2):
+                    proc = subprocess.Popen(
+                        [sys.executable, '-c', entry, str(self.repo), str(root), str(lock_file)],
+                        cwd=Path(__file__).resolve().parents[1], stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True,
+                    )
+                    processes.append(proc)
+                    self.assertTrue(select.select([proc.stdout], [], [], 10)[0], 'process did not reach the lock')
+                    self.assertEqual(proc.stdout.readline().strip(), 'queued')
+            results = [(proc.communicate(timeout=10)[0], proc.returncode) for proc in processes]
+        finally:
+            for proc in processes:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+                proc.stdout.close()
+        self.assertEqual(sorted(rc for _, rc in results), [1, 2], results)
+        self.assertIn('一批最多两次', next(out for out, rc in results if rc == 2))
+        self.assertEqual((self.repo / 'full-runs.log').read_text().splitlines(), ['full'])
+
+    @unittest.skipUnless(shutil.which('node'), 'Node is required for the verification entry point')
+    def test_verify_entry_resumes_failed_stages_and_unfinished_checks(self):
+        self._use_local_remote()
+        scripts = self.repo / 'scripts'
+        scripts.mkdir()
+        source = Path(__file__).resolve().parents[1]
+        shutil.copyfile(source / 'scripts/verify.sh', scripts / 'verify.sh')
+        (scripts / 'prepare_test_env.sh').write_text(
+            'echo setup >> "$VERIFY_TEST_TRACE"\ntest -f "$VERIFY_TEST_SETUP_READY"\n'
+        )
+        (scripts / 'verify_capabilities.py').write_text(
+            'import os\nwith open(os.environ["VERIFY_TEST_TRACE"], "a") as f:\n    f.write("capabilities\\n")\n'
+        )
+        tests = self.repo / 'tests'
+        tests.mkdir()
+        python_test = tests / 'test_probe.py'
+        python_source = (
+            'import os\nimport unittest\n\nclass Probe(unittest.TestCase):\n'
+            '    def test_example(self):\n'
+            '        with open(os.environ["VERIFY_TEST_TRACE"], "a") as f:\n'
+            '            f.write("python\\n")\n'
+            '        self.assertTrue({})\n'
+        )
+        python_test.write_text(python_source.format('False'))
+        bots_dir = self.repo / 'adapters' / 'bots'
+        bots_dir.mkdir(parents=True)
+        bot_test = bots_dir / 'test.mjs'
+        sdk_test = bots_dir / 'sdk-smoke.mjs'
+        for path, label in ((bot_test, 'bots'), (sdk_test, 'bot-sdk')):
+            path.write_text(
+                'import { appendFileSync } from "node:fs";\n'
+                'import assert from "node:assert/strict";\n'
+                f'appendFileSync(process.env.VERIFY_TEST_TRACE, "{label}\\n");\n'
+                'assert.equal(false, true);\n'
+            )
+        _git(self.repo, 'add', '.')
+        _git(self.repo, 'commit', '-qm', 'verification fixtures')
+
+        trace = self.t / 'trace'
+        sdk_ready = self.t / 'sdk-ready'
+        options = {'store_root': self.t / 'root', 'lock_path': self.t / 'verify.lock'}
+        key = test_gate.STATE_PREFIX + 'demo'
+        with patch.dict(os.environ, {'VERIFY_TEST_TRACE': str(trace), 'VERIFY_TEST_SETUP_READY': str(sdk_ready)}):
+            for _ in range(2):
+                rc, plan = test_gate.verify_entry(self.repo, **options)
+                self.assertEqual((rc, plan['mode']), (1, 'full'))
+                self.assertEqual(self.s.get(key)['full_runs'], 0)
+            self.assertEqual(trace.read_text().splitlines(), ['setup', 'setup'])
+            sdk_ready.touch()
+            rc, plan = test_gate.verify_entry(self.repo, **options)
+            self.assertEqual((rc, plan['mode']), (1, 'full'))
+            self.assertEqual(self.s.get(key)['resume_stage'], 'python')
+            self.assertEqual(trace.read_text().splitlines(), ['setup', 'setup', 'setup', 'python'])
+
+            python_test.write_text(python_source.format('True'))
+            _git(self.repo, 'commit', '-qam', 'fix python')
+            rc, plan = test_gate.verify_entry(self.repo, **options)
+            self.assertEqual((rc, plan['mode'], plan['resume_stage']), (1, 'partial', 'python'))
+            self.assertEqual(self.s.get(key)['resume_stage'], 'bots')
+
+            bot_test.write_text(bot_test.read_text().replace('false', 'true'))
+            _git(self.repo, 'commit', '-qam', 'fix node')
+            rc, plan = test_gate.verify_entry(self.repo, **options)
+            self.assertEqual((rc, plan['mode'], plan['resume_stage']), (1, 'partial', 'bots'))
+            self.assertEqual(self.s.get(key)['resume_stage'], 'bot-sdk')
+            self.assertEqual(self.s.get(key)['full_runs'], 1)
+
+            sdk_test.write_text(sdk_test.read_text().replace('false', 'true'))
+            _git(self.repo, 'commit', '-qam', 'fix sdk')
+            rc, plan = test_gate.verify_entry(self.repo, **options)
+            self.assertEqual((rc, plan['mode'], plan['resume_stage']), (0, 'partial', 'bot-sdk'))
+            self.assertEqual(self.s.get(key)['full_runs'], 0)
+        self.assertEqual(trace.read_text().splitlines(),
+                         ['setup', 'setup', 'setup', 'python', 'setup', 'python', 'bots',
+                          'setup', 'bots', 'bot-sdk', 'setup', 'bot-sdk', 'capabilities'])
 
     # —— 第三块：4 个老漏洞代码化 ——
 
@@ -233,6 +429,45 @@ class CodeGates0257Test(unittest.TestCase):
         hist = (self.repo / res['archive_path']).read_text()
         self.assertIn('动态第 21 条', hist)
         self.assertIn('动态第 25 条', hist)
+
+    def test_agents_requires_both_references_on_the_first_line(self):
+        agents=self.repo/'AGENTS.md'
+        agents.write_text('开发规则见 portable/protocol.json，先读 STATUS.md。\n')
+        self.assertFalse(any('AGENTS.md 首行' in message for message in board.weekly_check(self.s)))
+        agents.write_text('开发规则见 工具/开发协议.md。\n先读 STATUS.md。\n')
+        self.assertTrue(any('AGENTS.md 首行' in message for message in board.weekly_check(self.s)))
+
+    def test_installation_digest_change_triggers_board_refresh(self):
+        from portable.supervisor import Runner
+        source=Path(__file__).resolve().parents[1]
+        app=self.t/'installed'
+        distribution.build(source,app)
+        app_store=Store(app)
+        self.addCleanup(app_store.db.close)
+        path=app/'AGENTS.md'
+        original=path.read_bytes()
+        modified_at=path.stat()
+        board.apply(app_store,[{'id':'demo','name':'演示','path':str(self.repo),
+                                'status_path':str(self.repo/'STATUS.md')}])
+        runner=Runner(app_store,clock=lambda:1795161600)
+        runner.tick()
+        page=app/'看板/全部项目.md'
+        baseline=board.board_fingerprint(app_store)
+        self.assertNotIn('安装目录文件被手改过',page.read_text())
+
+        path.write_bytes(original[:-1]+b'X')
+        os.utime(path,ns=(modified_at.st_atime_ns,modified_at.st_mtime_ns))
+        self.assertNotEqual(baseline,board.board_fingerprint(app_store))
+        with self.assertRaisesRegex(Blocked,'发行校验失败'):
+            app_store.doctor()
+        runner.tick()
+        self.assertIn('安装目录文件被手改过',board.backup_reminders(app_store)[0])
+        self.assertIn('安装目录文件被手改过',page.read_text())
+
+        path.write_bytes(original)
+        self.assertEqual(baseline,board.board_fingerprint(app_store))
+        runner.tick()
+        self.assertNotIn('安装目录文件被手改过',page.read_text())
 
     def test_tampered_install_dir_and_overlong_agents_md_are_caught(self):
         # 1. AGENTS.md 超 40 行每周体检点名
