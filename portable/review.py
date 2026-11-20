@@ -25,6 +25,7 @@ KINDS={
     '卡住':'同一个问题修了两轮还没好。把握分写「照窗口现在的思路能修好的可能」；原因列最可能的 1 到 3 个；建议做法写建议换的做法；严重问题列你看到的严重或重要问题，没有就空列表；避坑写一句「场景｜坑｜经验」，没有就空串。',
     '方案':'大活开工前审方案。把握分写「照这个方案做能通过验收的把握」；严重问题只列严重和重要问题（会出错、会丢数据、有安全漏洞、和需求不符），风格和小建议不列；原因写打这个分的主要理由；建议做法写最该先改的一处；避坑没有就空串。',
     '事后':'出事以后复盘（回滚、返工、被用户纠正）。避坑必须是一句「场景｜坑｜经验」；原因写出事最可能的原因；把握分写「照现在的改法不会再犯的把握」；建议做法写以后该怎么做；严重问题列还没解决的严重问题，没有就空列表。',
+    '合并':'合并重要改动（规矩、CI、合并把关、删测试、合主干）前的独立审查。把握分写「照当前改动合进去不会出错、不丢数据、无安全漏洞的把握」；严重问题只列严重和重要问题（会出错、会丢数据、有安全漏洞、破坏已有功能、缺少必要测试），没有就空列表；原因写打分依据；建议做法写合并前必须先改的一处，没有就写「可以合并」；避坑没有就空串。',
 }
 TIMEOUT=600
 TEST_LOG_LINES=200
@@ -58,7 +59,7 @@ def classify(path,added=0,binary=False):
     if p.suffix.lower() in DUMP_EXT or (p.suffix.lower()=='.sql' and (DUMP_NAME.search(name) or added>DUMP_SQL_LINES)):return '数据库导出'
     if p.suffix.lower()=='.log' or any(x in ('log','logs','日志','聊天记录') for x in parts[:-1]):return '日志或聊天记录'
     if binary:return '二进制'
-    if p.suffix.lower() in CODE_EXT|DOC_EXT or name in CODE_NAMES:return None
+    if p.suffix.lower() in CODE_EXT|DOC_EXT or name in CODE_NAMES or path=='portable/protocol.json':return None
     return '不是代码或文档'
 
 
@@ -74,9 +75,9 @@ def default_base(repo,git=_git):
     raise Blocked('找不到对比基准（gitea/origin 的 development 或 main 都没有）：用 --base 写明从哪儿比')
 
 
-def collect_diff(repo,base,git=_git):
+def collect_diff(repo,base,git=_git,head='HEAD'):
     """git diff <base>...HEAD，只留代码和文档文件。返回（改动文字, 进包的文件, 没进包的文件和原因）。"""
-    code,out,_=git(repo,'diff','--no-color','--no-ext-diff','--no-textconv','--no-renames','--numstat','-z',base+'...HEAD')
+    code,out,_=git(repo,'diff','--no-color','--no-ext-diff','--no-textconv','--no-renames','--numstat','-z',base+'...'+head)
     if code:raise Blocked('算不出 '+base+'...HEAD 的改动（基准不存在或和当前分支没有共同祖先）：用 --base 换一个')
     included=[];excluded=[]
     for item in out.split('\0'):
@@ -86,8 +87,8 @@ def collect_diff(repo,base,git=_git):
         reason=classify(path,0 if binary else int(added or 0),binary)
         (excluded.append({'文件':path,'原因':reason}) if reason else included.append(path))
     if not included:return '',included,excluded
-    code,text,_=git(repo,'diff','--no-color','--no-ext-diff','--no-textconv','--no-renames',base+'...HEAD','--',*[':(literal)'+p for p in included])
-    if code:raise Blocked('读改动内容失败：'+base+'...HEAD')
+    code,text,_=git(repo,'diff','--no-color','--no-ext-diff','--no-textconv','--no-renames',base+'...'+head,'--',*[':(literal)'+p for p in included])
+    if code:raise Blocked('读改动内容失败：'+base+'...'+head)
     if len(text.encode())>MAX_DIFF:raise Blocked(f'改动太大（超过 {MAX_DIFF//1024} KB），复盘看不过来：用 --base 换一个更近的基准')
     return text,included,excluded
 
@@ -118,10 +119,10 @@ def _read_log(path):
     return f'（共 {len(lines)} 行，只取最后 {min(len(lines),TEST_LOG_LINES)} 行）\n'+tail+'\n'
 
 
-def build_package(repo,kind,note,test_log=None,base=None,git=_git):
+def build_package(repo,kind,note,test_log=None,base=None,git=_git,head='HEAD'):
     """按白名单拼出要发的几份文字（文件名 → 内容）和清单；不读白名单以外的东西。"""
     base=base or default_base(repo,git)
-    diff,included,excluded=collect_diff(repo,base,git)
+    diff,included,excluded=collect_diff(repo,base,git,head)
     files={'说明.md':_read_note(note),'目标.md':_status_goals(repo),'改动.diff':diff or '（这段范围里没有代码或文档改动）\n'}
     if test_log:files['测试输出.txt']=_read_log(test_log)
     return files,{'基准':base,'进包的改动文件':included,'没进包的文件':excluded}
@@ -180,11 +181,33 @@ def scan(directory,files,gitleaks=None):
 
 
 def reviewer(writer='claude',writer_model=None):
-    """复盘方：一律是关掉全部工具的 claude -p，模型和写的人不同。写的是 Claude 就换 sonnet（写的人本身是 sonnet 就换 opus）；写的是 Codex 用 opus。"""
+    """复盘方：关掉全部工具的 claude -p，模型和写的人不同。写的是 Claude 就换 sonnet（写的人本身是 sonnet 就换 opus）；写的是 Codex 用 opus。"""
     if writer not in ('claude','codex'):raise Blocked('--writer 只能写 claude 或 codex')
     model='opus' if writer=='codex' or 'sonnet' in (writer_model or '').lower() else 'sonnet'
     return model,['--tools','','--strict-mcp-config','--mcp-config','{"mcpServers":{}}','--disable-slash-commands','--safe-mode',
                   '--no-session-persistence','--permission-prompts','none','--model',model,'--output-format','stream-json','--verbose']
+
+
+def discover_reviewers(writer='claude',writer_model=None,which=None):
+    which=which or shutil.which
+    """动态扫描本机具备强制只读/无工具隔离的 AI 命令行池子（claude -p --tools '' 与 codex exec --sandbox read-only）：
+    - 有 >=2 种 AI 时，优先挑和当前 writer 不同厂家的 AI 交叉审查；首选限额或无法启动时自动切下一家；
+    - 只有 1 种 AI 时，用该 AI 新起干净、无上下文的独立只读进程；
+    - 0 种可用时返回空列表（合并审查会执行纯代码硬检查放行，不卡死）。"""
+    model,claude_flags=reviewer(writer if writer in ('claude','codex') else 'claude',writer_model)
+    specs={
+        'claude':lambda b:{'kind':'claude','厂商':'Anthropic','经由':'claude -p（关掉全部工具）','模型':model,'argv':[b,'-p',*claude_flags],'mode':'claude_stream'},
+        'codex':lambda b:{'kind':'codex','厂商':'OpenAI','经由':'codex exec（只读沙盒）','模型':'codex-readonly','argv':[b,'exec','--sandbox','read-only','--skip-git-repo-check','-'],'mode':'plain'},
+    }
+    order=('codex','claude') if writer=='claude' else ('claude','codex')
+    pool=[]
+    for name in order:
+        binary=which(name)
+        if not binary:continue
+        bname=Path(binary).name.lower()
+        if any(other!=name and other in bname for other in specs):continue
+        pool.append(specs[name](binary))
+    return pool
 
 
 def prompt(kind,files):
@@ -287,55 +310,114 @@ def _void(target,record,reason,raw):
     record.update({'结果':'作废','作废原因':reason})
 
 
+def _extract_plain_json(text):
+    raw=(text or '').strip()
+    if not raw:return ''
+    start=raw.find('{');end=raw.rfind('}')
+    return raw[start:end+1] if start!=-1 and end>start else raw
+
+
 def review(store,project,kind,note,writer='claude',test_log=None,base=None,writer_model=None,
-           runner=None,gitleaks=None,git=_git,now=time.time,timeout=TIMEOUT,claude=None):
+           runner=None,gitleaks=None,git=_git,now=time.time,timeout=TIMEOUT,claude=None,candidates=None):
     if kind not in KINDS:raise Blocked('--kind 只能写 '+'、'.join(KINDS))
     project_id,project_name,repo=_project(store,project)
     model,flags=reviewer(writer,writer_model)
+    _,head_sha,_=git(repo,'rev-parse','-q','--verify','HEAD^{commit}')
+    head_sha=(head_sha or '').strip()
     with _Lock(store.root/ARCHIVE/'.锁'/(_slug(project_id)+'.lock')):
-        files,meta=build_package(repo,kind,note,test_log,base,git)
+        files,meta=build_package(repo,kind,note,test_log,base,git,head_sha or 'HEAD')
         with tempfile.TemporaryDirectory(prefix='复盘-包-') as staging:
             for name,text in files.items():(Path(staging)/name).write_text(text,encoding='utf-8')
             hits=scan(staging,files,gitleaks)
         if hits:
             lines='；'.join(f"{h['文件']} 第 {h['行']} 行"+(f"（来自 {h['来自']}）" if h.get('来自') else '')+f"（{h['哪一道']}）" for h in hits[:20])
             raise Blocked(f'材料里有 {len(hits)} 处像密钥或连接串，整包不发，什么都没发出去：{lines}'+('；还有更多' if len(hits)>20 else '')+'。改掉材料（或换 --base / 说明文件）再来；不自动打码后照发')
-        claude=claude or shutil.which('claude')
-        if not claude:raise Blocked('这台电脑找不到 claude 命令，复盘方没法跑；本次没发任何材料')
+        if claude is not None:
+            pool=[{'kind':'claude','厂商':'Anthropic','经由':'claude -p（关掉全部工具）','模型':model,'argv':[claude,'-p',*flags],'mode':'claude_stream'}]
+        elif candidates is not None:
+            pool=list(candidates)
+        else:
+            claude_bin=shutil.which('claude')
+            if kind!='合并':
+                if not claude_bin:raise Blocked('这台电脑找不到 claude 命令，复盘方没法跑；本次没发任何材料')
+                pool=discover_reviewers(writer,writer_model) or [{'kind':'claude','厂商':'Anthropic','经由':'claude -p（关掉全部工具）','模型':model,'argv':[claude_bin,'-p',*flags],'mode':'claude_stream'}]
+            else:
+                pool=discover_reviewers(writer,writer_model)
         text=prompt(kind,files)
         started=now();target=_archive_dir(store,project_id,kind,started)
         (target/'包').mkdir()
         for name,body in files.items():atomic(target/'包'/name,body)
         atomic(target/'包'/'提问.txt',text)
-        argv=[claude,'-p',*flags]
+        first=pool[0] if pool else {'厂商':'本机代码硬检查','经由':'纯代码硬检查（无独立AI命令行）','模型':'code-gate','argv':['code-gate'],'mode':'code_only'}
+        argv=first['argv']
         record={'项目':project_name,'项目id':project_id,'类型':kind,'时间':time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(started)),
-                '接收方':dict(REVIEWER,模型=model),'写的人':writer+(f'（{writer_model}）' if writer_model else ''),
+                '接收方':{k:first[k] for k in ('厂商','经由','模型')},'写的人':writer+(f'（{writer_model}）' if writer_model else ''),
                 '文件':[{'名称':n,'字节':len(b.encode()),'行数':len(b.splitlines())} for n,b in files.items()],
                 '提问字节':len(text.encode()),'基准':meta['基准'],'进包的改动文件':meta['进包的改动文件'],'没进包的文件':meta['没进包的文件'],
-                '密钥检查':'gitleaks 和自带去密钥规则都没命中','命令':[Path(claude).name,'-p',*flags],'结果':'发送中'}
+                '密钥检查':'gitleaks 和自带去密钥规则都没命中','命令':[Path(argv[0]).name,*argv[1:]],'结果':'发送中'}
+        if head_sha:record['头提交']=head_sha
         atomic(target/'发送记录.json',json.dumps(record,ensure_ascii=False,indent=2)+'\n')
         answer=None
         empty=tempfile.mkdtemp(prefix='复盘-空目录-')
         try:
-            try:code,out,err=(runner or run_cli)(argv,text,empty,timeout)
-            except OSError as e:_void(target,record,'复盘方没启动起来：'+type(e).__name__,'')
-            except subprocess.TimeoutExpired as e:
-                partial=e.output.decode('utf-8','replace') if isinstance(e.output,bytes) else (e.output or '')
-                _void(target,record,f'超时：{timeout//60} 分钟没回答完，已停下复盘方',partial)
-            else:
-                init,result=read_stream(out)
-                if init:
-                    record['接收方']['实际模型']=init.get('model') or ''
-                    record['复盘方启动时的工具']={'工具':init.get('tools'),'MCP':init.get('mcp_servers')}
-                raw=(result or {}).get('result')
-                if code or not result or result.get('is_error'):_void(target,record,f'复盘方没正常结束（退出码 {code}）',raw if isinstance(raw,str) else (out+'\n'+err)[-20000:])
-                elif not init or init.get('tools') or init.get('mcp_servers'):_void(target,record,'确认不了复盘方没有工具（启动信息缺失或带了工具），这次回答不算',raw or '')
+            tried=[]
+            for cand in pool:
+                c_argv=cand['argv']
+                record['接收方']={k:cand[k] for k in ('厂商','经由','模型')}
+                record['命令']=[Path(c_argv[0]).name,*c_argv[1:]]
+                try:code,out,err=(runner or run_cli)(c_argv,text,empty,timeout)
+                except OSError as e:
+                    tried.append((cand,'复盘方没启动起来：'+type(e).__name__,''))
+                    continue
+                except subprocess.TimeoutExpired as e:
+                    partial=e.output.decode('utf-8','replace') if isinstance(e.output,bytes) else (e.output or '')
+                    tried.append((cand,f'超时：{timeout//60} 分钟没回答完，已停下复盘方',partial))
+                    continue
+                if cand.get('mode')=='plain':
+                    if code:
+                        tried.append((cand,f'复盘方没正常结束（退出码 {code}）',(out+'\n'+err)[-20000:]))
+                        continue
+                    raw=_extract_plain_json(out)
+                    ans,problem=parse_answer(raw,kind)
+                    if ans is None:
+                        tried.append((cand,'格式不对：'+problem,out[-20000:]))
+                        continue
+                    answer=ans
+                    atomic(target/'回答.json',json.dumps(answer,ensure_ascii=False,indent=2)+'\n')
+                    record.update({'结果':'有回答','把握分':answer['把握分']})
+                    break
                 else:
-                    answer,problem=parse_answer(raw,kind)
-                    if answer is None:_void(target,record,'格式不对：'+problem,raw or '')
-                    else:
-                        atomic(target/'回答.json',json.dumps(answer,ensure_ascii=False,indent=2)+'\n')
-                        record.update({'结果':'有回答','把握分':answer['把握分']})
+                    init,result=read_stream(out)
+                    if init:
+                        record['接收方']['实际模型']=init.get('model') or ''
+                        record['复盘方启动时的工具']={'工具':init.get('tools'),'MCP':init.get('mcp_servers')}
+                    raw=(result or {}).get('result')
+                    if code or not result or result.get('is_error'):
+                        tried.append((cand,f'复盘方没正常结束（退出码 {code}）',raw if isinstance(raw,str) else (out+'\n'+err)[-20000:]))
+                        continue
+                    if not init or init.get('tools') or init.get('mcp_servers'):
+                        tried.append((cand,'确认不了复盘方没有工具（启动信息缺失或带了工具），这次回答不算',raw or ''))
+                        continue
+                    ans,problem=parse_answer(raw,kind)
+                    if ans is None:
+                        tried.append((cand,'格式不对：'+problem,raw or ''))
+                        continue
+                    answer=ans
+                    atomic(target/'回答.json',json.dumps(answer,ensure_ascii=False,indent=2)+'\n')
+                    record.update({'结果':'有回答','把握分':answer['把握分']})
+                    break
+            if answer is None:
+                if kind=='合并' and claude is None and not pool:
+                    from .ci import code_hard_check
+                    code_hard_check(store,repo,head_sha)
+                    answer={'把握分':80,'原因':[{'说明':'本机未安装可用的独立 AI 命令行，已实际执行纯代码硬检查（密钥扫描、协议核心规则与模块白名单）通过','位置':''}],
+                            '建议做法':'可以合并（代码硬检查放行）','严重问题':[],'避坑':''}
+                    record['接收方']={'厂商':'本机代码硬检查','经由':'纯代码硬检查（本机无独立AI命令行）','模型':'code-gate'}
+                    atomic(target/'回答.json',json.dumps(answer,ensure_ascii=False,indent=2)+'\n')
+                    record.update({'结果':'代码硬检查放行','把握分':answer['把握分'],'降级模式':'代码硬检查放行'})
+                elif tried:
+                    _,reason,raw_last=tried[-1]
+                    _void(target,record,reason,raw_last)
         finally:
             if os.path.isdir(empty) and not os.listdir(empty):os.rmdir(empty)
             record['用时秒']=int(now()-started)
@@ -348,6 +430,31 @@ def review(store,project,kind,note,writer='claude',test_log=None,base=None,write
     else:out['作废原因']=record.get('作废原因')
     return out
 
+
+
+
+def find_merge_receipt(store,project,head_sha=None):
+    """查找该项目在 数据/复盘/ 下是否有通过的「合并」独立审查回执（类型必须是合并、必须有头提交且与 head_sha 完全一致、把握分 >= 60 且严重问题为空）。"""
+    base=store.root/ARCHIVE
+    if not base.is_dir():return None
+    try:project_id,project_name,_=_project(store,project)
+    except Exception:project_id=project_name=str(project)
+    for d in sorted(base.iterdir(),reverse=True):
+        if d.name.startswith('.') or not d.is_dir():continue
+        rec_file=d/'发送记录.json';ans_file=d/'回答.json'
+        if not rec_file.is_file() or not ans_file.is_file():continue
+        try:
+            rec=json.loads(rec_file.read_text(encoding='utf-8'))
+            ans=json.loads(ans_file.read_text(encoding='utf-8'))
+        except ValueError:continue
+        if rec.get('结果') not in ('有回答','代码硬检查放行') or rec.get('类型')!='合并':continue
+        if rec.get('项目id') not in (project_id,project_name) and rec.get('项目') not in (project_id,project_name):continue
+        rec_sha=(rec.get('头提交') or '').strip()
+        if not rec_sha:continue
+        if head_sha and rec_sha!=str(head_sha).strip():continue
+        if isinstance(ans.get('把握分'),int) and ans['把握分']>=LOW and not ans.get('严重问题'):
+            return {'存档':d.name,'路径':str(d),'把握分':ans['把握分'],'接收方':rec.get('接收方'),'头提交':rec_sha,'结果':rec.get('结果')}
+    return None
 
 def weekly_summary(store,now,days=7):
     """体检那天往前 7 天的复盘次数和低于 60 分的（体检在每周一开头跑，所以「本周」按往前 7 天算）。没有复盘返回 None。"""

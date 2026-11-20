@@ -64,13 +64,13 @@ def main(argv=None):
     a=sub.add_parser('backup');a.add_argument('destination');a.add_argument('--kind',choices=['daily','weekly','upgrade'],default='daily')
     a=sub.add_parser('recover-material');a.add_argument('id')
     a=sub.add_parser('remove-material');a.add_argument('id')
-    from . import automation, supervisor, backup_git, bots, onboarding, workflows, knowledge, session_adapters, context_server, portability, git_portable, db_adapters, planner, sensitive, transfer, candidates, component_cli, legacy_cli, move_in, assist, wizard, leave, cost, upgrade_channel, t3_setup, taskline_handoff, ci, review
-    direct_modules=(automation,supervisor,backup_git,bots,portability,git_portable,db_adapters,planner,sensitive,transfer,candidates,component_cli,legacy_cli,move_in,assist,wizard,leave,cost,upgrade_channel,t3_setup,taskline_handoff,ci,review)
+    from . import automation, supervisor, backup_git, bots, onboarding, workflows, knowledge, session_adapters, context_server, portability, git_portable, db_adapters, planner, sensitive, transfer, candidates, component_cli, legacy_cli, move_in, assist, wizard, leave, cost, upgrade_channel, t3_setup, taskline_handoff, ci, review, test_gate
+    direct_modules=(automation,supervisor,backup_git,bots,portability,git_portable,db_adapters,planner,sensitive,transfer,candidates,component_cli,legacy_cli,move_in,assist,wizard,leave,cost,upgrade_channel,t3_setup,taskline_handoff,ci,review,test_gate)
     store_modules={'onboarding':onboarding,'workflow':workflows,'knowledge':knowledge,'sessions':session_adapters,'context':context_server}
     for module in (*direct_modules,*store_modules.values()):module.register(sub)
     args=p.parse_args(argv)
     try:
-        direct=next((getattr(args,key) for key in ('automation_run','runner_run','backup_git_run','bots_run','portability_run','git_portable_run','database_run','planner_run','sensitive_run','transfer_run','candidates_run','components_run','legacy_run','move_in_run','assist_run','wizard_run','leave_run','cost_run','upgrade_run','t3_setup_run','taskline_run','ci_run','review_run') if hasattr(args,key)),None)
+        direct=next((getattr(args,key) for key in ('automation_run','runner_run','backup_git_run','bots_run','portability_run','git_portable_run','database_run','planner_run','sensitive_run','transfer_run','candidates_run','components_run','legacy_run','move_in_run','assist_run','wizard_run','leave_run','cost_run','upgrade_run','t3_setup_run','taskline_run','ci_run','review_run','test_gate_run') if hasattr(args,key)),None)
         if direct:
             result=direct(args)
             if args.cmd=='t3-setup' and result is None:return 0

@@ -219,12 +219,54 @@ def _repo_has_docs_gate(api,idn,base):
     except rp.DeliveryError as error:return getattr(error,'code',None)!=404
 
 
+def check_mixed_progress_pr(files,has_docs_gate=True):
+    """配了轻量文档 CI 的仓库：功能 PR 不许顺手改已有的 STATUS.md / 功能清单.md（首次 added 除外，见【收工必写】）。"""
+    if not has_docs_gate:return
+    from .ci_docs_only import _is_doc_path,DOC_FILES
+    has_code=any(not _is_doc_path(name) for name,_,_ in files if name)
+    mixed_progress=[name for name,status,_ in files if name in DOC_FILES and status not in ('added','new')]
+    if has_code and mixed_progress:
+        raise Blocked('这个 PR 同时改了代码和进度表（'+'、'.join(mixed_progress)+'）：按【收工必写】功能 PR 不改这两份文件，先把它们从本 PR 撤回，代码合并后再另开文档 PR（首次新建除外）')
+
+
+def code_hard_check(store,project_path,expected_sha=None):
+    """第一道关：所有电脑 100% 能跑的纯代码硬检查（不依赖任何外部 AI）；传入 expected_sha 时优先从该 Git 提交树读取，防止本地工作区与待合 PR 不一致。"""
+    import subprocess
+    root=Path(project_path)
+    proto_text=None;actual=None
+    if expected_sha and (root/'.git').exists():
+        chk=subprocess.run(['git','-C',str(root),'cat-file','-e',f'{expected_sha}^{{commit}}'],capture_output=True,timeout=15)
+        if chk.returncode==0:
+            show=subprocess.run(['git','-C',str(root),'show',f'{expected_sha}:portable/protocol.json'],capture_output=True,text=True,timeout=15)
+            if show.returncode==0:
+                proto_text=show.stdout
+                ls=subprocess.run(['git','-C',str(root),'ls-tree','--name-only',f'{expected_sha}:portable'],capture_output=True,text=True,timeout=15)
+                if ls.returncode==0:
+                    actual={n.strip() for n in ls.stdout.splitlines() if Path(n.strip()).suffix in ('.py','.json')}
+    if proto_text is None:
+        proto_file=root/'portable/protocol.json'
+        if proto_file.is_file():
+            proto_text=proto_file.read_text(encoding='utf-8')
+            actual={f.name for f in (root/'portable').iterdir() if f.is_file() and f.suffix in ('.py','.json')}
+    if proto_text is not None:
+        try:proto=json.loads(proto_text)
+        except Exception as e:raise Blocked('代码硬检查未通过：protocol.json 格式损坏：'+str(e))
+        rules=proto.get('public_rules') or []
+        for must in ('【四件事要点头】','【按风险分级】','【只移不删】','【密钥】'):
+            if not any(str(r).startswith(must) for r in rules):
+                raise Blocked('代码硬检查未通过：核心安全规矩被删减（缺少 '+must+'）')
+        runtime_files=set((proto.get('distribution') or {}).get('runtime_files') or ())
+        if not runtime_files or (actual is not None and runtime_files!=actual):
+            raise Blocked('代码硬检查未通过：运行模块白名单与 portable/ 实际文件不一致')
+
+
 def docs_mode_check(api,idn,result,files,log_reader=None):
     """合并前再判一次「只改文档」，并和 CI 日志里的模式对账（第 77 题方案甲§3）。返回 (类别, CI 模式)；对不上就 Blocked。"""
     from .ci_docs_only import classify
     mine,_=classify(files)
     kind='文档类' if mine=='docs' else '代码类'
     if not _repo_has_docs_gate(api,idn,result.get('目标分支') or 'main'):return kind,'未接轻量CI'
+    check_mixed_progress_pr(files,True)
     reader=log_reader or _read_job_log
     modes=set()
     import re
@@ -239,15 +281,25 @@ def docs_mode_check(api,idn,result,files,log_reader=None):
 
 
 def merge(store,project,number,confirm=False,wait_first=False,timeout=3600,api=None,merger=None,sleep=time.sleep,clock=time.monotonic,no_run_minutes=10,now=time.time,risk=None,approval='',log_reader=None):
-    if not confirm:raise Blocked('合并要加 --confirm：低风险改动 CI 通过就可以加；高风险的等用户明确说合以后再加（见【按风险分级】）')
+    if not confirm:raise Blocked('合并要加 --confirm：低风险改动 CI 通过就可以加；高风险通过代码硬检查与独立审查（review --kind 合并）后再加（见【按风险分级】）')
     if risk not in ('低','高'):raise Blocked('合并要写 --risk 低 或 --risk 高（见【按风险分级】）；拿不准就按高')
-    if risk=='高' and not (approval or '').strip():raise Blocked('高风险合并要写 --approval "<用户点头的原话和出处>"，没有用户点头就不合')
+    from .review import find_merge_receipt
+    if risk=='高' and not (approval or '').strip() and find_merge_receipt(store,project) is None:
+        raise Blocked('高风险合并需要先跑 review <项目> --kind 合并 通过独立审查（或写 --approval "<用户点头的原话和出处>"），没有审查通过就不合')
     api=api or rp.api
     result=wait(store,project,number,timeout,api=api,sleep=sleep,clock=clock,no_run_minutes=no_run_minutes,now=now) if wait_first else check(store,project,number,api,no_run_minutes,now)
     if result['结论']!=PASS:
         result['已合并']=result['结论']=='已合并';result['本次合并']=False
         return result
-    idn=_identity(_project(store,project));sha=result['头提交']
+    proj_path=_project(store,project)
+    idn=_identity(proj_path);sha=result['头提交']
+    if risk=='高':
+        code_hard_check(store,proj_path,sha)
+        if not (approval or '').strip():
+            receipt=find_merge_receipt(store,project,sha)
+            if receipt is None:
+                raise Blocked(f'高风险合并找不到当前头提交（{sha[:12]}）的独立审查通过回执：请先跑 review <项目> --kind 合并')
+            approval=f"独立审查通过：{receipt['存档']}（把握分 {receipt['把握分']}）" 
     if risk=='低':
         base=result.get('目标分支') or ''
         if base in ('main','master') and _has_branch(api,idn,'development'):

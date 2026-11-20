@@ -393,6 +393,12 @@ def backup_reminders(store,now=None):
             reminders.insert(0,f'后台处于暂停，什么都不做（谁停的：{why.get("by") or "未写明"}；{when}；原因：{why.get("reason") or "未写明"}）：不是你让停的就说「帮我恢复后台」')
         else:  # 没记原因：多半是换了电脑或挪了位置，为防两台电脑重复干活先停下（2026-11-16 U 盘实测）
             reminders.insert(0,'后台处于暂停，什么都不做（没记原因，常见于换了电脑或挪了位置：为防两台电脑重复干活先停下）：换了电脑就说「我换电脑了，把项目接回来」，否则说「帮我恢复后台」')
+    if (store.root/'发行.json').is_file():
+        try:
+            from .distribution import release_verify
+            release_verify(store.root)
+        except Exception as e:
+            reminders.insert(0,'安装目录文件被手改过（'+str(e)+'）：不许在安装目录手改代码或协议，请用 upgrade apply 重新安装或退回上一版')
     from .wizard import risky_location
     try:place=risky_location(store.root)
     except Exception:place=''
@@ -1038,6 +1044,70 @@ def docs_gate_drift(entry):
         return r.stdout!=original
     except Exception:return False
 
+MAX_RECENT_UPDATES=20
+MAX_AGENTS_LINES=40
+
+def count_recent_updates(text):
+    """数 STATUS.md 里「## 近期动态」下的顶层条目数（以 '- ' 开头、无前导缩进的行）。"""
+    in_sec=False;count=0
+    for line in (text or '').splitlines():
+        if line.startswith('## '):
+            if line.strip()=='## 近期动态':in_sec=True;continue
+            if in_sec:break
+        if not in_sec:continue
+        if line.startswith(('较早记录见','较早动态')):break
+        if line.startswith('- '):count+=1
+    return count
+
+def trim_status_updates(repo,max_entries=MAX_RECENT_UPDATES,stamp=None):
+    """当 STATUS.md 的「## 近期动态」超过 max_entries 条时，自动把第 max_entries+1 条起移进 docs/历史/（只移不删）。"""
+    repo=Path(repo);status_path=repo/'STATUS.md'
+    if not status_path.is_file():raise Blocked('找不到 STATUS.md：'+str(status_path))
+    text=status_path.read_text(encoding='utf-8')
+    lines=text.splitlines()
+    sec_start=None;sec_end=len(lines)
+    for i,line in enumerate(lines):
+        if line.strip()=='## 近期动态':sec_start=i+1;continue
+        if sec_start is not None and (line.startswith('## ') or line.startswith(('较早记录见','较早动态'))):
+            sec_end=i;break
+    if sec_start is None:return {'total':0,'kept':0,'moved':0,'archive_path':None}
+    body=lines[sec_start:sec_end]
+    entries=[];cur=None
+    leading=[]
+    for line in body:
+        if line.startswith('- '):
+            cur=[line];entries.append(cur)
+        elif cur is not None:
+            cur.append(line)
+        else:
+            leading.append(line)
+    total=len(entries)
+    if total<=max_entries:return {'total':total,'kept':total,'moved':0,'archive_path':None}
+    kept=entries[:max_entries];moved=entries[max_entries:]
+    while kept and kept[-1] and not kept[-1][-1].strip():kept[-1].pop()
+    stamp=stamp or time.strftime('%Y%m%d')
+    hist_dir=repo/'docs/历史';hist_dir.mkdir(parents=True,exist_ok=True)
+    rel_hist=f'docs/历史/STATUS-{stamp}-动态归档.md'
+    hist_path=repo/rel_hist
+    moved_text='\n'.join('\n'.join(item).rstrip() for item in moved)+'\n'
+    header=f'# STATUS 历史动态归档（{stamp} 移出，原样保留）\n\n> 由随身开发按【收工必写】「近期动态最多 {max_entries} 条」从 STATUS.md 移出。\n\n'
+    if hist_path.is_file():
+        old_hist=hist_path.read_text(encoding='utf-8').rstrip()+'\n\n'+moved_text
+        atomic(hist_path,old_hist)
+    else:
+        atomic(hist_path,header+moved_text)
+    new_body=leading+[line for item in kept for line in item]+['']
+    tail=lines[sec_end:]
+    link_note=f'[{stamp} 动态归档]({rel_hist})'
+    if tail and tail[0].startswith(('较早记录见','较早动态')):
+        if rel_hist not in tail[0]:
+            tail[0]=tail[0].rstrip('。.')+'、'+link_note+'。'
+    else:
+        new_body+=[f'较早记录见{link_note}。','']
+    new_lines=lines[:sec_start]+new_body+tail
+    atomic(status_path,'\n'.join(new_lines).rstrip()+'\n')
+    return {'total':total,'kept':max_entries,'moved':len(moved),'archive_path':rel_hist}
+
 def weekly_check(store,today=None,tasks=None):
     """每周体检：超 14 天没更新、等用户超 7 天、工作法空了满 14 天、归档里放满 30 天的（每周提醒一次）、需求稿 30 天没改而代码改了 20 次以上、战队任务做完超 7 天没人验收；
     工作树三件（每周每项目各一次）：自动清掉目录已不在的登记、列出已合并且干净的工作树、列出超 14 天没动又没合并的分支或工作树。每条只提醒一次（记住已提醒的）。
@@ -1091,6 +1161,21 @@ def weekly_check(store,today=None,tasks=None):
             found.append((e['name']+':progress-lag:'+week,f'{e["name"]}：{ref} 上最后一次改 STATUS.md 之后，又合进了 {n} 个功能改动，超过 1 天进度表还没更新；另开文档 PR 补上（见【收工必写】）'))
         if docs_gate_drift(e):
             found.append((e['name']+':docs-gate-drift:'+week,f'{e["name"]}：仓库里的 tools/ci/docs_only.py 和随身开发的原件不一致，「只改文档」两边判法可能不同；照原件改回'))
+        root_p=Path(e['path'])
+        agents_f=root_p/'AGENTS.md'
+        if agents_f.is_file() and not (root_p/'发行.json').is_file():
+            try:
+                alines=agents_f.read_text(encoding='utf-8',errors='replace').splitlines()
+                if len(alines)>MAX_AGENTS_LINES:
+                    found.append((e['name']+':agents-lines:'+week,f'{e["name"]}：AGENTS.md 有 {len(alines)} 行（规矩上限 {MAX_AGENTS_LINES} 行），请精简到 {MAX_AGENTS_LINES} 行以内'))
+            except OSError:pass
+        status_f=Path(e.get('status_path') or (root_p/'STATUS.md'))
+        if status_f.is_file():
+            try:
+                ucount=count_recent_updates(status_f.read_text(encoding='utf-8',errors='replace'))
+                if ucount>MAX_RECENT_UPDATES:
+                    found.append((e['name']+':status-over20:'+week,f'{e["name"]}：STATUS.md 近期动态有 {ucount} 条（规矩上限 {MAX_RECENT_UPDATES} 条），旧记录请移进 docs/历史/'))
+            except OSError:pass
     old_archive=archive_overdue(now)
     if old_archive:
         n,size=old_archive
