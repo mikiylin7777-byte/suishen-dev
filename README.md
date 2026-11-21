@@ -27,9 +27,11 @@
 装好后，在任何能读写本机文件的 AI 对话里贴一句启动语（见安装目录里的 `启动语.md`），之后用大白话说话就行，比如「各项目怎么样」「给 XX 加一个导出按钮」。
 
 ## 升级与退回
-从 0.2.58 升到 0.2.59 时，让 AI 从 [Releases](https://github.com/mikiylin7777-byte/suishen-dev/releases) 下载新版 ZIP，核对发布页的 SHA256 后解压。旧安装入口会拒绝新版清单。请 AI 用解压后新版的 `工具/portable.pyz` 执行 `--root <现有安装目录> upgrade apply <解压后新版目录>`，保留现有数据和设置。
-- 要退回上一版，可让 AI 用当前安装入口执行 `upgrade rollback`。
+已经装好的用户不用重新下载配置，直接对你的 AI 说：
+- **「把随身开发升级到最新版」**（AI 执行 `python3 ~/随身开发/工具/portable.pyz --root ~/随身开发 upgrade apply`；如果是 0.2.55 及更早版本，让 AI 从 [Releases](https://github.com/mikiylin7777-byte/suishen-dev/releases) 下载最新 `suishen-dev-<版本>.zip` 解压后执行一次 `upgrade apply`，之后就会记住仓库一键自动升级）。
+- 不满意随时对 AI 说**「退回上一版」**（`upgrade rollback`），数据和项目设置原封不动。
 
+从 0.2.59 升到 0.2.60 时，请按 [0.2.60 发布说明](https://github.com/mikiylin7777-byte/suishen-dev/releases/tag/v0.2.60) 下载、核验 SHA256，并用解压后的新版入口升级。
 
 ## 用起来是什么样
 - 你：「各项目怎么样？」→ AI 读看板，用两三句话告诉你哪些在动、哪些等你拍板。

@@ -1,8 +1,10 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from portable.core import Blocked, Store
 from portable import ci
 
@@ -203,11 +205,12 @@ class CiTest(unittest.TestCase):
         with self.assertRaises(Blocked) as e:ci.merge(self.s,'demo',1,confirm=True,risk='低',api=api,merger=lambda *a:None)
         self.assertIn('CI 判定脚本',str(e.exception))
 
-    def _release_fixture(self, mixed_source=False, moved_progress=False):
-        def git(*args):
+    def _release_fixture(self, mixed_source=False, moved_progress=False, merged_at='2026-11-20T11:08:37+08:00'):
+        def git(*args, committer_date=None):
             return subprocess.run(
                 ['git', '-C', str(self.repo), '-c', 'user.name=test', '-c', 'user.email=test@example.com', *args],
                 capture_output=True, text=True, check=True,
+                env=dict(os.environ, GIT_COMMITTER_DATE=committer_date) if committer_date else None,
             ).stdout.strip()
 
         git('checkout', '-qb', 'main')
@@ -232,9 +235,12 @@ class CiTest(unittest.TestCase):
             git('commit', '-qm', branch)
             source = git('rev-parse', 'HEAD')
             git('checkout', '-q', 'development')
-            git('merge', '--no-ff', '-qm', f"Merge pull request '{branch}' (#{number}) from test/{branch} into development", source)
+            git('merge', '--no-ff', '-qm',
+                f"Merge pull request '{branch}' (#{number}) from test/{branch} into development",
+                source, committer_date=merged_at)
             records[number] = {'merged': True, 'merge_commit_sha': git('rev-parse', 'HEAD'),
-                               'base': {'ref': 'development', 'repo': repo}, 'head': {'sha': source}}
+                               'base': {'ref': 'development', 'repo': repo}, 'head': {'sha': source},
+                               'merged_at': merged_at}
 
         def feature():
             (self.repo / 'app.py').write_text('print(1)')
@@ -359,8 +365,42 @@ class CiTest(unittest.TestCase):
         with self.assertRaisesRegex(Blocked, '来源 PR #2'):
             ci.release_check(self.s, 'demo', 1, head, api, lambda *_: ci.MODE_MARK + 'full')
 
+    def test_release_batch_lists_only_mixed_sources_merged_before_rule(self):
+        api, head, records = self._release_fixture(mixed_source=True, merged_at='2026-11-20T11:08:35+08:00')
+        records[2]['merged_at'] = '2026-11-20T03:08:35Z'
+        result = ci.release_check(self.s, 'demo', 1, head, api, lambda *_: ci.MODE_MARK + 'full')
+        self.assertEqual(result['结论'], ci.PASS)
+        self.assertEqual(result['来源PR'], [2, 3])
+        self.assertEqual(result['规则生效前合入未查'], [2])
+
+    def test_release_batch_requires_server_time_before_rule_even_with_backdated_commit(self):
+        api, head, records = self._release_fixture(mixed_source=True, merged_at='2026-11-20T03:08:35Z')
+        log_reader = lambda *_: ci.MODE_MARK + 'full'
+        del records[2]['merged_at']
+        with self.assertRaisesRegex(Blocked, '来源 PR #2 未通过进度表检查'):
+            ci.release_check(self.s, 'demo', 1, head, api, log_reader)
+        for merged_at in ('2026-11-20T03:08:37Z', '2026-11-20T03:08:36Z', 'invalid', '2026-11-19T19:53:15'):
+            records[2]['merged_at'] = merged_at
+            with self.subTest(merged_at=merged_at), self.assertRaisesRegex(Blocked, '来源 PR #2 未通过进度表检查'):
+                ci.release_check(self.s, 'demo', 1, head, api, log_reader)
+
+    def test_release_batch_refuses_exemption_without_valid_cutoff(self):
+        api, head, _ = self._release_fixture(mixed_source=True, merged_at='2026-11-20T03:08:35Z')
+        for protocol in ({}, {'release_batch': {}}, {'release_batch': {'progress_rule_effective_at': 'invalid'}}):
+            with self.subTest(protocol=protocol), patch.object(ci, 'PROTOCOL', protocol):
+                with self.assertRaisesRegex(Blocked, '来源 PR #2 未通过进度表检查'):
+                    ci.release_check(self.s, 'demo', 1, head, api, lambda *_: ci.MODE_MARK + 'full')
+
+    def test_progress_with_docs_only_is_not_mixed(self):
+        files = [('STATUS.md', 'modified', ''), ('功能清单.md', 'modified', ''),
+                 ('docs/避坑.md', 'modified', ''), ('docs/appendix.csv', 'added', '')]
+        ci.check_mixed_progress_pr(files)
+        with self.assertRaisesRegex(Blocked, '同时改了代码和进度表'):
+            ci.check_mixed_progress_pr(files + [('docs/example.py', 'added', '')])
+
     def test_release_batch_rename_is_not_the_first_progress_file_exception(self):
-        api, head, _ = self._release_fixture(moved_progress=True)
+        api, head, records = self._release_fixture(moved_progress=True, merged_at='2026-11-20T03:08:36+00:00')
+        records[2]['merged_at'] = '2026-11-20T03:08:35Z'
         with self.assertRaisesRegex(Blocked, '来源 PR #2'):
             ci.release_check(self.s, 'demo', 1, head, api, lambda *_: ci.MODE_MARK + 'full')
 

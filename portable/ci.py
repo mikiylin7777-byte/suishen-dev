@@ -10,10 +10,11 @@ import json
 import re
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request
-from .core import Blocked
+from .core import Blocked, PROTOCOL
 from . import remote_publish as rp
 
 PASS='通过'
@@ -361,6 +362,29 @@ def _release_ci_checks(api, idn, result):
     return verified
 
 
+def _aware_timestamp(value):
+    if not isinstance(value, str):
+        return None
+    if value.endswith('Z'):
+        value = value[:-1] + '+00:00'
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed.timestamp() if parsed.tzinfo is not None else None
+
+
+def _release_progress_exempt(path, sha, merged_at):
+    # 见 DECISIONS 2026-11-21
+    rules = PROTOCOL.get('release_batch')
+    cutoff = _aware_timestamp(rules.get('progress_rule_effective_at')) if isinstance(rules, dict) else None
+    server_time = _aware_timestamp(merged_at)
+    if cutoff is None or server_time is None or server_time >= cutoff:
+        return False
+    commit_time = _release_git(path, 'show', '-s', '--format=%ct', sha).strip()
+    return commit_time.isdecimal() and int(commit_time) < cutoff
+
+
 def _verify_release_batch(api, idn, path, result, log_reader=None):
     if idn['platform'] != 'gitea':
         raise Blocked('发布批次核验目前需要 Gitea 的合并记录和 CI 作业日志')
@@ -378,6 +402,7 @@ def _verify_release_batch(api, idn, path, result, log_reader=None):
         raise Blocked('固定头不在本仓库 development 的第一父链上')
     commits = _release_git(path, 'rev-list', '--first-parent', '--reverse', '--parents', f'{start}..{head}').splitlines()
     source_prs = []
+    historical_mixed_prs = []
     parent = start
     for commit_line in commits:
         commit = commit_line.split()
@@ -394,10 +419,13 @@ def _verify_release_batch(api, idn, path, result, log_reader=None):
         if (pr.get('merged') is not True or pr.get('merge_commit_sha') != sha
                 or target.get('ref') != 'development' or (target.get('repo') or {}).get('full_name') != idn['repo']):
             raise Blocked(f'来源 PR #{number} 的 Gitea 合并记录与 development 不一致')
+        files = _release_files(path, parent, sha)
         try:
-            check_mixed_progress_pr(_release_files(path, parent, sha))
+            check_mixed_progress_pr(files)
         except Blocked as error:
-            raise Blocked(f'来源 PR #{number} 未通过进度表检查：{error}') from None
+            if not _release_progress_exempt(path, sha, pr.get('merged_at')):
+                raise Blocked(f'来源 PR #{number} 未通过进度表检查：{error}') from None
+            historical_mixed_prs.append(number)
         source_prs.append(number)
         parent = sha
     if not source_prs or parent != head:
@@ -406,7 +434,8 @@ def _verify_release_batch(api, idn, path, result, log_reader=None):
     kind, ci_mode = docs_mode_check(api, idn, ci_result, _release_files(path, start, head), log_reader, release_batch=True)
     if _release_snapshot(api, idn, result) != base:
         raise Blocked('核验期间发布的目标分支已更新，请重新核验')
-    return kind, ci_mode, {'发布共同基线': start, '发布目标提交': base, '来源PR': source_prs}
+    return kind, ci_mode, {'发布共同基线': start, '发布目标提交': base, '来源PR': source_prs,
+                           '规则生效前合入未查': historical_mixed_prs}
 
 
 def release_check(store, project, number, release_head, api=None, log_reader=None, no_run_minutes=10):
