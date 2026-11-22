@@ -3,10 +3,12 @@
 import contextlib
 import io
 import json
+import os
 import subprocess
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 from portable.core import Blocked, Store
@@ -16,8 +18,9 @@ FAKE_TOKEN='ghp_'+'Zx9Yw8Vu7Ts6Rq5Po4Nm3Lk2Ji1Hg0FeDcBa'
 FAKE_DB='postgres://app_admin:'+'Tr0ub4dor-Horse'+'@db.internal:5432/orders'
 
 
-def git(repo,*args):
-    subprocess.run(['git','-C',str(repo),'-c','user.name=t','-c','user.email=t@t',*args],check=True,capture_output=True)
+def git(repo, *args, date=None):
+    env = dict(os.environ, GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date) if date else None
+    subprocess.run(['git','-C',str(repo),'-c','user.name=t','-c','user.email=t@t',*args],check=True,capture_output=True,env=env)
 
 
 def answer(**over):
@@ -43,16 +46,18 @@ class FakeRunner:
 class ReviewTest(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.t=Path(self.tmp.name).resolve()
-        import os;home=patch.dict(os.environ,{'PORTABLE_HOME':str(self.t/'home')});home.start();self.addCleanup(home.stop)  # 不读真实的 ~/归档
+        home=patch.dict(os.environ,{'PORTABLE_HOME':str(self.t/'home')});home.start();self.addCleanup(home.stop)  # 不读真实的 ~/归档
         self.s=Store(self.t/'随身开发')
         self.repo=self.t/'项目';self.repo.mkdir()
         git(self.repo,'init','-q','-b','main')
         (self.repo/'STATUS.md').write_text('---\n项目: 玩具\n长期目标: 完成 1 块 / 共 2 块；本期：求和；卡在：无\n下一步: 修空列表\n卡在: 无\n---\n')
         (self.repo/'src').mkdir();(self.repo/'src/app.py').write_text('def total(xs):\n    return sum(xs)\n')
-        git(self.repo,'add','.');git(self.repo,'commit','-qm','init')
+        # 每周体检按提交时间计算分支年龄，必须与测试传入的日期一起固定。
+        commit_date = '2026-11-15T00:00:00+00:00'
+        git(self.repo,'add','.');git(self.repo,'commit','-qm','init',date=commit_date)
         git(self.repo,'switch','-qc','feat')
         (self.repo/'src/app.py').write_text('def total(xs):\n    return xs[0]+sum(xs[1:])\n')
-        git(self.repo,'commit','-qam','change')
+        git(self.repo,'commit','-qam','change',date=commit_date)
         self.note=self.t/'说明.md';self.note.write_text('目标：求和。试过：两轮。卡在：空列表报错。\n')
         self.good=FakeRunner(stream(json.dumps(answer(),ensure_ascii=False)))
     def tearDown(self):self.tmp.cleanup()
@@ -232,6 +237,24 @@ class ReviewTest(unittest.TestCase):
         later=board.weekly_check(self.s,today=today+20*86400)
         self.assertEqual([m for m in later if '复盘' in m],[])  # 那一周没有复盘就不写
         self.assertEqual([m for m in later if '复盘' not in m],['玩具有 1 处超过 14 天没动、也没合进主线或开发分支（如 feat）：还要不要，回一句即可'])  # 0.2.45 起列出久没动又没合并的分支
+
+    def test_weekly_line_resets_at_local_monday_in_singapore(self):
+        self.addCleanup(time.tzset)
+        zone = patch.dict(os.environ, {'TZ': 'Asia/Singapore'})
+        zone.start()
+        self.addCleanup(zone.stop)
+        time.tzset()
+
+        # 新加坡跨入周一时，UTC 仍是周日。
+        sunday = datetime(2026, 11, 15, 15, 59, 59, tzinfo=timezone.utc).timestamp()
+        monday = sunday + 1
+        board.apply(self.s, [{'id': 'toy', 'name': '玩具', 'path': str(self.repo)}])
+        self.run_review(now=lambda: sunday - 60)
+        expected = ['本周复盘 1 次，其中 1 次把握分低于 60（玩具）']
+        self.assertEqual(board.weekly_check(self.s, today=sunday), expected)
+        self.assertEqual(board.weekly_check(self.s, today=sunday), [])
+        self.assertEqual(board.weekly_check(self.s, today=monday), expected)
+        self.assertEqual(board.weekly_check(self.s, today=monday), [])
 
     def test_cli_registered(self):
         from portable.__main__ import main

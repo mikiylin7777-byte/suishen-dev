@@ -68,11 +68,23 @@ def connect_tools(store,tools,home=None):
     store.put(HOOKS,list(record.values()))
     return done
 
+DISPATCH_OPTIONS={
+    'host':('用 AI 工具自带的帮手','自带','自带帮手','宿主'),
+    't3':('装 T3，用 T3 子会话（建议）','装 t3','t3 子会话','子会话'),
+    'team':('接战队','战队','ai 战队'),
+    'solo':('都没有','没有','自己做','不派工'),
+}
+DISPATCH_QUESTION='AI 干活时，要不要再叫别的 AI 帮忙？\n'+'\n'.join(
+    f'{number}. {labels[0]}'+('（回车默认）' if number==1 else '')
+    for number,labels in enumerate(DISPATCH_OPTIONS.values(),1)
+)
+TEAM_ENTRY_QUESTION='战队的派工命令是什么？'
+
 QUESTIONS=[
     ('owner_name','怎么称呼你','用户'),
     ('workspace','你的项目一般放在哪个文件夹（回车用家目录）','~'),
     ('code_hosting','代码只存本机，还是也推到网上的代码仓库？推到网上换电脑最省事（回车=只存本机；填 remote=推到网上）','local'),
-    ('team_enabled','有没有 AI 战队帮你干活？（回车=没有；填 有）','没有'),
+    ('dispatch_mode',DISPATCH_QUESTION,'1'),
     ('billing','你用的 AI 是包月，还是按用量花钱？（回车=包月；填 按量）','包月'),
 ]
 
@@ -80,7 +92,10 @@ def ask():
     """终端一问一答；只问业务问题，不问技术细节。"""
     out={}
     for key,q,default in QUESTIONS:
-        out[key]=input(q+'：').strip() or default
+        out[key]=input(q+('\n选择：' if key=='dispatch_mode' else '：')).strip() or default
+        if key=='dispatch_mode' and normalize({key:out[key]})[key]=='team':
+            command=input(TEAM_ENTRY_QUESTION+' ').strip()
+            if command:out['team_entry']=command
     if out['code_hosting']=='remote':out['hosting_url']=input('网上仓库的地址（回车以后再填）：').strip()
     if out['billing']=='按量':
         raw=input('单次超过多少元要先问你（回车=20）：').strip()
@@ -89,6 +104,12 @@ def ask():
 
 def normalize(answers):
     a=dict(answers)  # 只换算用户答了的项；没答的不碰，免得把已有设置改回默认
+    if 'dispatch_mode' in a and type(a['dispatch_mode']) in (int,str):
+        choice=str(a['dispatch_mode']).strip().casefold()
+        for number,(mode,labels) in enumerate(DISPATCH_OPTIONS.items(),1):
+            if choice in (str(number),mode,*(label.casefold() for label in labels)) or (number==1 and not choice):
+                a['dispatch_mode']=mode
+                break
     if 'team_enabled' in a:
         if a['team_enabled'] in ('有','是','yes','true'):a['team_enabled']=True
         elif a['team_enabled'] in ('没有','否','no','false','',None):a['team_enabled']=False
@@ -113,7 +134,10 @@ def run_wizard(store,answers,home=None,scan=True):
     current=settings.load(store)
     if current['projects'] is None:current['projects']=settings.current_registrations(store)
     first=not settings.path(store).is_file()
-    for k,v in a.items():settings._check(k,v);current[k]=v
+    current=settings.apply_changes(current,a)
+    if a.get('dispatch_mode')=='team' and not current['team_entry'].strip():
+        raise Blocked('选「接战队」时请填写战队的派工命令（team_entry）')
+    mode,plan_only=settings.effective_dispatch(current)
     # 朋友版、对外版第一次配置默认大白话；升级、完整版不改，没写就是带编号
     if first and 'talk_style' not in a and _edition(store)=='friend':current['talk_style']='大白话'
     settings.save(store,current)
@@ -129,6 +153,8 @@ def run_wizard(store,answers,home=None,scan=True):
     if not cfg.get('backup_dir'):
         supervisor.configure_local(store,{**cfg,'backup_dir':str(store.root.parent/'随身开发备份')})
     reminders=[]
+    if a.get('dispatch_mode')=='t3':
+        reminders.append('还没装 T3 时，可以用 t3-setup 查看安装方式。建议在 T3 里接上另一家 AI 给子会话用。')
     try:
         if sys.platform!='darwin':raise Blocked('这台电脑不是 Mac，暂不支持自动安装后台')
         status=supervisor.service(store.root,home/'Library/LaunchAgents','install',execute=True)
@@ -149,7 +175,8 @@ def run_wizard(store,answers,home=None,scan=True):
     store.put(DONE,{'at':time.time()})
     nxt='先把下面这张清单给用户看，等用户说要搬哪几个再动手（没列出来的，问用户在哪个文件夹）；用户点名后 AI 用 move-in adopt --confirmed 原地登记' if found else '说「建一个示例项目带我走一遍」，五分钟看一遍完整流程'
     return {'提醒':reminders,'已配置':True,'称呼':current['owner_name'],'代码存放':'推到网上仓库' if current['code_hosting']=='remote' else '只存本机',
-            'AI 战队':'已接入' if current['team_enabled'] else '没有（AI 自己动手）','计费':'按量（超额先问）' if current['billing']=='metered' else '包月',
+            '派工方式':DISPATCH_OPTIONS[mode][0],'窗口只规划审核':'开' if plan_only else '关',
+            '计费':'按量（超额先问）' if current['billing']=='metered' else '包月',
             '接入的 AI 工具':connected,'建议搬进来的项目':found,'下一步':nxt,
             '你的启动语':'请先读「'+str(store.root/'AGENTS.md')+'」，按里面的规矩当我的开发助手；我不懂代码，用大白话跟你说需求。'}
 
@@ -165,7 +192,9 @@ def run(args):
             answers=json.loads(sys.stdin.read() if args.answers=='-' else Path(args.answers).read_text(encoding='utf-8'))
             if not isinstance(answers,dict):raise Blocked('答案要是 JSON 对象')
         elif args.show_questions:
-            return {'要问的事':[{'项':k,'问法':q,'默认':d} for k,q,d in QUESTIONS],'说明':'AI 用大白话问完，把答案写成 JSON 交给 wizard --answers'}
+            return {'要问的事':[{'项':k,'问法':q,'默认':d} for k,q,d in QUESTIONS],
+                    '选「接战队」时再问':{'项':'team_entry','问法':TEAM_ENTRY_QUESTION},
+                    '说明':'AI 用大白话问完，把答案写成 JSON 交给 wizard --answers'}
         elif sys.stdin.isatty():answers=ask()
         else:raise Blocked('没有答案：在 AI 对话里先问清楚，再用 wizard --answers 答案.json')
         return run_wizard(s,answers,scan=not args.no_scan)

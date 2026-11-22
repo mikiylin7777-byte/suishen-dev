@@ -34,8 +34,8 @@ class WizardTest(Base):
     def test_plain_answers_configure_rules_hook_tools_and_suggest_projects(self):
         (self.home/'.claude').mkdir();(self.home/'.claude/CLAUDE.md').write_text('我自己的规则\n')
         ws=self.home/'工作区';git_repo(ws/'记账本')
-        r=wizard.run_wizard(self.s,{'owner_name':'小王','workspace':str(ws),'code_hosting':'只存本机','team_enabled':'没有','billing':'按量','cost_limit_yuan':5})
-        self.assertEqual((r['称呼'],r['代码存放'],r['AI 战队']),('小王','只存本机','没有（AI 自己动手）'))
+        r=wizard.run_wizard(self.s,{'owner_name':'小王','workspace':str(ws),'code_hosting':'只存本机','dispatch_mode':'都没有','billing':'按量','cost_limit_yuan':5})
+        self.assertEqual((r['称呼'],r['代码存放'],r['派工方式'],r['窗口只规划审核']),('小王','只存本机','都没有','关'))
         self.assertEqual([p['名字'] for p in r['建议搬进来的项目']],['记账本'])
         text=(self.home/'.claude/CLAUDE.md').read_text()
         self.assertTrue(text.startswith('我自己的规则\n'));self.assertIn('@'+str(self.s.root)+'/数据/本机规则.md',text)
@@ -52,6 +52,7 @@ class WizardTest(Base):
         wizard.run_wizard(self.s,{'owner_name':'小王','team_enabled':'有','code_hosting':'remote','billing':'按量'},scan=False)
         wizard.run_wizard(self.s,{'tools':['codex']},scan=False)  # 只补接入，不该把战队/存放/计费改回默认
         v=settings.load(self.s)
+        self.assertEqual(settings.effective_dispatch(v),('team',False))
         self.assertEqual((v['team_enabled'],v['code_hosting'],v['billing'],v['owner_name']),(True,'remote','metered','小王'))
 
     def test_unknown_answer_rejected_and_no_answers_in_non_tty_blocks(self):
@@ -61,7 +62,20 @@ class WizardTest(Base):
     def test_cli_show_questions_lists_only_plain_questions(self):
         out=subprocess.run(['python3','-B','-m','portable','--root',str(self.s.root),'wizard','--show-questions'],cwd=SOURCE,capture_output=True,text=True,env={**os.environ,'PYTHONPATH':str(SOURCE)})
         self.assertEqual(out.returncode,0,out.stderr)
-        self.assertEqual(len(json.loads(out.stdout)['要问的事']),5)
+        value=json.loads(out.stdout)
+        questions=value['要问的事']
+        self.assertEqual(len(questions),5)
+        self.assertNotIn('team_enabled',[q['项'] for q in questions])
+        dispatch=next(q for q in questions if q['项']=='dispatch_mode')
+        self.assertEqual(dispatch['默认'],'1')
+        self.assertEqual(dispatch['问法'].splitlines(),[
+            'AI 干活时，要不要再叫别的 AI 帮忙？',
+            '1. 用 AI 工具自带的帮手（回车默认）',
+            '2. 装 T3，用 T3 子会话（建议）',
+            '3. 接战队',
+            '4. 都没有',
+        ])
+        self.assertEqual(value['选「接战队」时再问']['项'],'team_entry')
 
 class LeaveTest(Base):
     def test_plan_first_then_restore_rules_and_archive_everything(self):

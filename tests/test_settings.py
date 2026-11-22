@@ -87,8 +87,25 @@ class OptionalHostingAndTeamTest(SettingsTest):
 
     def test_public_rules_do_not_assume_gitea_or_team(self):
         from portable.core import PROTOCOL
-        text='\n'.join(PROTOCOL['public_rules'])
-        self.assertNotIn('Gitea',text);self.assertIn('本机流程',text);self.assertIn('没接入战队时，大活由当前窗口按块顺序做',text)
+        rules = PROTOCOL['public_rules']
+        text = '\n'.join(rules)
+        self.assertNotIn('Gitea', text)
+        self.assertIn('本机流程', text)
+        project_rule = next(rule for rule in rules if rule.startswith('【项目】'))
+        self.assertIn('要不要叫别的 AI 帮忙（用 AI 工具自带的帮手 / 装 T3 用 T3 子会话 / 接战队 / 都没有）', project_rule)
+        self.assertEqual(text.count('战队'), 1)
+        self.assertIn('派出去仍待验收的帮手任务', text)
+        self.assertIn('本机用户的称呼、派工方式和个人附加规则', text)
+
+    def test_public_dispatch_rule_references_rendered_local_rule(self):
+        from portable.core import PROTOCOL
+        label = '【本机派工】'
+        dispatch_rule = next(rule for rule in PROTOCOL['public_rules'] if rule.startswith('【派工】'))
+        self.assertIn(f'本机附加规则{label}', dispatch_rule)
+
+        path = settings.render_rules(self.s, {'dispatch_mode': 'host'})
+        local_rules = Path(path).read_text(encoding='utf-8').splitlines()
+        self.assertTrue(any(line.startswith(f'- {label}') for line in local_rules))
 
     def test_fresh_install_without_team_runs_doctor_and_overview(self):
         from portable.board import overview
@@ -101,15 +118,28 @@ if __name__=='__main__':unittest.main()
 
 class DispatchRuleTest(unittest.TestCase):
     def test_dispatch_defaults_to_window_and_parallel_blocks(self):
-        # 0.2.43（见 DECISIONS 2026-11-14）：默认窗口自己写；大活拆成互不冲突的块并行派战队。
         from portable.core import PROTOCOL
         rules=PROTOCOL['public_rules']
         rule=next(x for x in rules if x.startswith('【派工】'))
-        for words in ('默认窗口自己写','一个窗口能做完的改动','不派战队','互不冲突的块','同时并行派给 AI 战队','拆成 N 块并行','报错原文发给战队会话','改为自己做'):
-            self.assertIn(words,rule)
-        self.assertNotIn('默认用战队入口派给它',rule);self.assertNotIn('这次没派工，原因：',rule)
+        for words in (
+            '本机附加规则【本机派工】开了「只规划审核」时，本协议里凡写「窗口自己写、自己测」的地方，'
+            '改为窗口把写和测派给帮手、自己审查验收，负责到底的仍是这个窗口。',
+            '本机附加规则【本机派工】没开「只规划审核」时，一个窗口能做完的改动自己写、自己测、自己合；开了就按它派出去',
+            'review <项目> --kind 方案 请一个不写这份代码的 AI 只读挑错（不算派工）',
+            '高风险的方案要用户定稿',
+            '互不冲突的块',
+            '有帮手时，同时并行派给本机附加规则【本机派工】写明的帮手',
+            '拆成 N 块并行',
+            '派工按【本机派工】写明的入口走',
+            '帮手自报通过不算数，窗口亲自重跑测试、看改动后才合',
+            '派工失败按【本机派工】写的退路走，没写就自己做',
+            '没有帮手时，大活由当前窗口按块顺序做',
+        ):
+            self.assertIn(words, rule)
+        self.assertNotIn('这次没派工，原因：', rule)
         risk=next(x for x in rules if x.startswith('【按风险分级】'))
+        self.assertIn('窗口自己写、自己审（开了只规划审核时，写的部分派给帮手，审仍由窗口做）', risk)
         for words in ('低风险','高风险','自己审','只拦严重和重要问题','ci merge','备份','回滚','拿不准算哪一档，就按高风险','改规矩'):
             self.assertIn(words,risk)
-        self.assertIn('同一个窗口负责到底',rule);self.assertIn('上线和改真实数据',rule);self.assertIn('派工一律走战队入口',rule)  # 0.2.43 瘦身：【一人到底】【派工可见】并入【派工】
+        self.assertIn('同一个窗口负责到底',rule);self.assertIn('上线和改真实数据',rule)
         self.assertLess(rules.index(risk),rules.index(next(x for x in rules if x.startswith('【标准套路】'))))

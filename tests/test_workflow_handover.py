@@ -15,7 +15,11 @@ class WorkflowHandoverTest(unittest.TestCase):
         rules=PROTOCOL['public_rules']
         self.assertIn('还没记的',next(r for r in rules if r.startswith('【收工必写】')))
         handoff=next(r for r in rules if r.startswith('【续接】'))  # 0.2.43：【交接包】并入【续接】
-        for words in ('近期动态','请求编号','数据/交接/','不放系统临时目录','不携带密钥','重新挂上监视','【交接包·战队】'):self.assertIn(words,handoff)
+        for words in ('近期动态','请求编号','数据/交接/','不放系统临时目录','不携带密钥','重新挂上监视'):self.assertIn(words,handoff)
+        self.assertIn(
+            '派出去的活还没回时，交接写清帮手的任务号、在哪查、怎么验收（见本机附加规则【本机派工】）。',
+            handoff,
+        )
         self.assertFalse(any(r.startswith('【交接包】') for r in rules))
         self.assertLessEqual(len(rules),30)  # 0.2.43 瘦身：43 条并成 27 条，别再涨回去
         # 0.2.37：【换人不换法】并入【开工先读】、【越做越聪明】并入【收工必写】，原文约束保留。
