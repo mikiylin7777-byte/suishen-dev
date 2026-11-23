@@ -957,6 +957,7 @@ class HandoffTests(unittest.TestCase):
         expected['distribution']['runtime_files'].remove('projects.json')  # 11-14 清理：源码里空的项目注册表，只有测试在读
         expected['distribution']['runtime_files'].append('nudge.py')  # 后台自动接着做（见 DECISIONS 2026-11-18）
         expected['distribution']['runtime_files'].append('test_gate.py')  # 0.2.57：全量测试守门（见 DECISIONS 2026-11-20）
+        expected['distribution']['runtime_files'].append('quota.py')  # 子会话选模型与额度协调（方案 2026-11-23）
         # 见 DECISIONS 2026-11-21
         expected['release_batch'] = {'progress_rule_effective_at': '2026-11-20T11:08:36+08:00'}
         # Public rule wording is reviewed per PR and guarded by test_workflow_handover, test_settings

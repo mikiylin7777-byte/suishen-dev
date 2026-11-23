@@ -341,7 +341,9 @@ def _extract_failed_modules(output):
 def verify_entry(repo, *, store_root=None, runner=None, lock_path=None):
     import sys
     repo = Path(repo).resolve()
-    store_dir = Path(store_root or os.environ.get('PORTABLE_GATE_ROOT') or (Path(tempfile.gettempdir()) / 'suishen-dev-test-gate-store'))
+    # macOS 的 /var、/tmp 是符号链接。不解析的话，运行目录的上级会被认成逃逸，全量守门还没开测就停。
+    default_store = Path(tempfile.gettempdir()).resolve() / 'suishen-dev-test-gate-store'
+    store_dir = Path(store_root or os.environ.get('PORTABLE_GATE_ROOT') or default_store)
     s = Store(store_dir)
     try:
         options = {

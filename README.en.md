@@ -11,7 +11,7 @@ Suishen Dev is not another AI. It gives the AI you already use (Codex, Claude Co
 - **Dashboard**: one page shows every project's stage, who it is waiting on and what is blocked (Obsidian-friendly).
 - **Merge gate**: changes merge only when every automated check passes; high-risk changes wait for your approval.
 - **Background service**: daily backups, weekly health checks, one-step upgrade and rollback.
-- **Helper commands**: screenshots of the result, undo the last change, move existing projects in, continue on another computer, secret-free help bundles — all run by the AI while you talk in plain language.
+- **Helper commands**: screenshots of the result, undo the last change, move existing projects in, continue on another computer, secret-free help bundles — all run by the AI while you talk in plain language. Allowance and model choice: `quota show`, `quota pick`. Check whether a statement holds: `review --kind 核实` (verdicts are only 真, 假, 一半对, 待确认, and a different AI vendor must do the check).
 
 The user interface and documentation are currently in Chinese.
 

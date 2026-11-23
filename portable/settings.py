@@ -3,30 +3,46 @@
 发行包里不写死任何人的路径或名字；这些都在 数据/本机设置.json（本人 600），由首次配置或 settings 命令写入。
 本机附加规则另生成 数据/本机规则.md，公共协议里写明「存在时一并遵守」。
 """
+import copy
 import json
 import os
 from pathlib import Path
 from .core import Blocked, atomic
+from .quota import DEFAULT_QUOTA, check_config
 
 FILE='数据/本机设置.json'
 RULES='数据/本机规则.md'
 DISPATCH_MODES=('host','t3','team','solo')
 DEFAULTS={'owner_name':'用户','team_name':'AI 战队','workspace':'','projects':None,'extra_rules':[],'code_hosting':'local','hosting_url':'','team_enabled':False,'billing':'subscription','cost_limit_yuan':20,'monthly_budget_yuan':0,'backup_dir':'','team_entry':'','talk_style':'','auto_continue':None,'auto_continue_hours':2,
-          'dispatch_mode':None,'plan_only':None,'max_parallel':4,'t3_sub_provider':''}
+          'dispatch_mode':None,'plan_only':None,'max_parallel':4,'t3_sub_provider':'','quota':DEFAULT_QUOTA}
 KEYS=tuple(DEFAULTS)
 
 def path(store):return Path(store.root)/FILE
 
+def _merge_quota(value):
+    """存档里的 quota 盖住默认值，缺的字段用默认补上。返回深拷贝，不碰默认表。"""
+    merged=copy.deepcopy(DEFAULT_QUOTA)
+    if isinstance(value,dict):
+        for key,item in value.items():
+            merged[key]=copy.deepcopy(item)
+    return merged
+
 def load(store):
     p=path(store)
-    if not p.is_file():return dict(DEFAULTS)
+    if not p.is_file():
+        value=dict(DEFAULTS)
+        value['quota']=_merge_quota(None)
+        return value
     if p.is_symlink():raise Blocked('本机设置不能是链接')
-    value=json.loads(p.read_text(encoding='utf-8'))
-    if not isinstance(value,dict):raise Blocked('本机设置格式不对')
-    return {**DEFAULTS,**{k:v for k,v in value.items() if k in KEYS}}
+    raw=json.loads(p.read_text(encoding='utf-8'))
+    if not isinstance(raw,dict):raise Blocked('本机设置格式不对')
+    value={**DEFAULTS,**{k:v for k,v in raw.items() if k in KEYS}}
+    value['quota']=_merge_quota(value.get('quota'))
+    return value
 
 def _check(key,value):
     if key not in KEYS:raise Blocked('未知设置项：'+key+'；可设：'+'、'.join(KEYS))
+    if key=='quota':check_config(value);return
     if key in ('owner_name','team_name','workspace') and not isinstance(value,str):raise Blocked(key+' 要是文字')
     if key=='code_hosting' and value not in ('local','remote'):raise Blocked('code_hosting 只能是 local（只存本机）或 remote（推到在线代码仓库）')
     if key=='hosting_url' and not isinstance(value,str):raise Blocked('hosting_url 要是文字')
@@ -91,6 +107,26 @@ def effective_dispatch(value):
 
 TEAM_RULES=["【战队续接】有未完战队任务时，使用新会话真实身份，先从正式入口只读核对原任务号、归属、当前运行和接任条件。归属相同且可续做时沿原入口继续，不额外套用仅转交适用的条件；需换归属时，复用已有明确接任授权，按项目流程登记并正式转交、读回，再继续同一任务。用户明确要求工程续做且条件已满足时，当回合执行续做，不能停在预检报告。不冒用旧 caller、不手改任务状态、不另派重复任务；原任务仍在运行时不并发续做，不为提高战队利用率恢复暂停项目。已有接任授权不重复问；确实缺授权、存在冲突写入或入口不支持时，给出确切缺项并继续不依赖它的工作。运行中的工人不重启。", "【交接包·战队】交接时另写：未完战队任务的原任务号、最后核对的归属/运行状态、候选路径、续接或验收入口、是否已正式转交及读回证据；发出去还没回的消息写对象 + 时间 + clientRequestId。"]
 
+def quota_rule(value):
+    """按 quota 里有没有按量出口，写【本机派工】里的那一段。"""
+    quota_value=value.get('quota') if isinstance(value,dict) else None
+    names=[]
+    if isinstance(quota_value,dict):
+        for entry in quota_value.get('metered_deepseek') or []:
+            if not isinstance(entry,dict):
+                continue
+            name=str(entry.get('vendor') or '').strip() or str(entry.get('model') or '').strip() or '按量'
+            if name not in names:
+                names.append(name)
+    head=('派活先按档位选模型（重/普通/轻，审查档和写代码的用不同家，先后只看配置里的首选，档位与型号对照见 quota show）；'
+          '撞过额度或限流的额度池按台账跳过，包月优先；')
+    if names:
+        middle=(f'包月全被挡时，普通和重先走按量出口〈{"、".join(names)}〉，记台账并告诉用户一句；'
+                '它也不可用时轻活和普通活排队、重活报用户。')
+    else:
+        middle='包月全被挡时，轻活和普通活排队，重活报用户。'
+    return head+middle+'排队时优先放行设置里的优先项目。'
+
 def _dispatch_rule(value,mode,plan_only):
     if mode=='solo':
         if value['dispatch_mode'] is None:
@@ -115,6 +151,8 @@ def _dispatch_rule(value,mode,plan_only):
             rule+=f'派工入口命令：{value["team_entry"]}（第一次用先看它的帮助，再按帮助派工；放后台运行，见【等不无限】）。'
         if plan_only:
             rule+=verify
+    if mode in ('host','t3'):
+        rule+=quota_rule(value)
     if plan_only:
         rule+='窗口只规划审核：读现状、定方案、拆块、写规格和验收标准、派工、审查验收、把关合并、记台账和汇报，其余全部派出去；派不出去报用户，不改回自己写。'
         if mode in ('host','t3'):
@@ -123,6 +161,7 @@ def _dispatch_rule(value,mode,plan_only):
 
 def render_rules(store,value=None):
     value=load(store) if value is None else {**DEFAULTS,**value}
+    value={**value,'quota':_merge_quota(value.get('quota'))}
     p=Path(store.root)/RULES
     lines=['# 本机附加规则','','> 由 settings 命令生成，只对本机生效；改规则请用 settings，不手改本文件。','']
     lines+=[f'- 用户称呼：{value["owner_name"]}；战队名称：{value["team_name"]}'+(f'；项目默认放在 {value["workspace"]}' if value['workspace'] else '')]

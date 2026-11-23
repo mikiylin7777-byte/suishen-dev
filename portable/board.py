@@ -673,7 +673,7 @@ def render(rows):
            '| 项目 | 状态 | 长期目标 | 阶段 | 完成度 | 下一步 | 等谁 | 卡在 | 最后更新 | 功能 ✅/🔄/⏳/⛔ | 开发进度来源 | 运行版本 |','|---|---|---|---|---|---|---|---|---|---|---|---|']
     for r in rows:
         c=r['功能'];f='/'.join(str(c[s]) for s in STATES[:4]) if c else '无功能清单'
-        v=(r['完成度'] or '').strip();done=v+'%' if v[:1].isdigit() and not v.endswith(('%','％')) else v
+        v=(r['完成度'] or '').strip();done=v+'%' if re.fullmatch(r'\d+(\.\d+)?',v) else v
         src=r.get('来源')
         if src in REMOTE_DEV:stage=r['阶段']+'（开发分支上的进度，还没合进主线）'
         else:stage=r['阶段']+('（分支 '+src+'，未合并）' if src not in (None,'工作区')+REMOTE_MAIN else '')

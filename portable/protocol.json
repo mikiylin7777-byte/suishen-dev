@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "version": "0.2.61",
+  "version": "0.2.62",
   "release_batch": {
     "progress_rule_effective_at": "2026-11-20T11:08:36+08:00"
   },
@@ -135,7 +135,8 @@
       "review.py",
       "ci_docs_only.py",
       "nudge.py",
-      "test_gate.py"
+      "test_gate.py",
+      "quota.py"
     ],
     "bot_files": [
       "README.md",

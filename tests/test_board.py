@@ -628,6 +628,15 @@ class PercentTest(unittest.TestCase):
         page=board.render([dict(base,完成度='50%'),dict(base,项目='q',完成度='78'),dict(base,项目='r',完成度='一期 100%（已验收）')])
         self.assertNotIn('%%',page);self.assertIn('| 50% |',page);self.assertIn('| 78% |',page);self.assertIn('一期 100%（已验收）',page)
 
+    def test_percent_only_appended_to_pure_numbers(self):
+        base={'项目':'p','状态':'进行中','阶段':'a','下一步':'b','等谁':'c','卡在':'无','最后更新':'2026-11-03','功能':None,'来源':'工作区','停了几天':0}
+        def done(v):return board.render([dict(base,完成度=v)])
+        self.assertIn('| 60% |',done('60'))
+        self.assertIn('| 60.5% |',done('60.5'))
+        self.assertIn('| 60% |',done('60%'));self.assertNotIn('| 60%% |',done('60%'))
+        self.assertIn('| 1 / 2 块 |',done('1 / 2 块'))
+        self.assertIn('| 完成 3 块 / 共 5 块 |',done('完成 3 块 / 共 5 块'))
+
 class BackupProtectionTest(unittest.TestCase):
     setUp=BoardTest.setUp
     tearDown=BoardTest.tearDown

@@ -175,6 +175,12 @@ class Product(unittest.TestCase):
         with self.assertRaises(Blocked):self.snap()
         (self.src/'config.txt').unlink();self.file('.git','gitdir: /unknown/path')
         with self.assertRaises(Blocked):self.snap()
+    def test_empty_password_in_review_archive_allows_snapshot(self):
+        self.file('数据/复盘/20261101-note.txt','ERP_DB_PASSWORD=""\n')
+        snap=self.snap()
+        self.assertEqual((snap/'payload/数据/复盘/20261101-note.txt').read_text(),'ERP_DB_PASSWORD=""\n')
+        self.file('数据/复盘/20261101-note.txt','ERP_DB_PASSWORD="abc12345"\n')
+        with self.assertRaises(Blocked):self.snap()
     def test_sqlite_consistent_online_backup(self):
         db=sqlite3.connect(self.src/'live.sqlite');db.execute('PRAGMA journal_mode=WAL');db.execute('CREATE TABLE t(v)');db.execute('INSERT INTO t VALUES (42)');db.commit()
         snap=self.snap();out=self.t/'restored';m.restore(snap,out)

@@ -23,6 +23,11 @@ def git(repo, *args, date=None):
     subprocess.run(['git','-C',str(repo),'-c','user.name=t','-c','user.email=t@t',*args],check=True,capture_output=True,env=env)
 
 
+def diff_block(path, lines):
+    header = f'diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{len(lines)} @@\n'
+    return header + ''.join(f'+{line}\n' for line in lines)
+
+
 def answer(**over):
     value={'把握分':42,'原因':[{'说明':'边界没处理','位置':'src/app.py:3'}],'建议做法':'先补边界测试','严重问题':[],'避坑':'改边界时｜漏了空列表｜先写空列表测试'}
     value.update(over);return value
@@ -120,6 +125,97 @@ class ReviewTest(unittest.TestCase):
             return [('改动.diff',n,'github-pat') for n,line in enumerate(text.splitlines(),1) if FAKE_TOKEN in line]
         message=self.assert_refused(leaks,'改动.diff 第')
         self.assertIn('来自 src/cfg.py',message);self.assertIn('gitleaks github-pat',message);self.assertIn('自带去密钥规则',message)
+
+    def test_review_accepts_source_references_and_short_test_value(self):
+        lines = (
+            "    authorization = load_authorization(path, mode=mode, operation='migrate', database=database, report_name_mismatch=True)",
+            "wizard.run_wizard(self.s,{'password':'x'})",
+            "authorization = settings.authorization_token",
+            "token = token_from_configuration",
+            'authorization = "load_authorization"',
+        )
+        (self.repo/'src/cfg.py').write_text('\n'.join(lines)+'\n')
+        git(self.repo,'add','.');git(self.repo,'commit','-qm','credential references')
+        self.run_review()
+        self.assertEqual(len(self.good.calls),1)
+        for line in lines:
+            self.assertIn(line,self.good.calls[0]['text'])
+
+    def test_diff_keeps_credential_checks_when_gitleaks_misses(self):
+        lines = (
+            'Authorization: Bearer abc123',
+            'Authorization: Basic dTpw',
+            'authorization="sk-'+'Zx9Yw8Vu7Ts6Rq5Po4Nm"',
+            'authorization="ZXy42aN83Mqi5VoL"',
+            "password='S3cr3t!x9'",
+            'token = "'+FAKE_TOKEN+'"',
+        )
+        patch_text = diff_block('src/config.py',lines)
+        hits = review.scan(self.t,{'改动.diff':patch_text},gitleaks=lambda _:[])
+        self.assertEqual([h['行'] for h in hits],list(range(5,len(lines)+5)))
+
+    def test_bare_credentials_are_blocked_in_source_and_config_blocks(self):
+        lines = (
+            'PASSWORD=hunter2hunter2',
+            'PASSWORD = hunter2hunter2',
+            'password: hunter2hunter2',
+            'api_key=abcdefghijklmnop1234',
+            '密码：abc123456',
+            'cookie: sessionid=abcdef123456',
+            'authorization=ZXy42aN83Mqi5VoLzz',
+        )
+        patch_text = diff_block('src/config.py',lines) + diff_block('.env',lines)
+        hits = review.scan(self.t,{'改动.diff':patch_text},gitleaks=lambda _:[])
+        self.assertEqual(
+            [(hit['来自'],hit['行']) for hit in hits],
+            [('src/config.py',n) for n in range(5,12)] + [('.env',n) for n in range(16,23)],
+        )
+
+    def test_source_exemptions_are_scoped_to_supported_diff_blocks(self):
+        line = "wizard.run_wizard(self.s,{'password':'x'})"
+        sources = ('example.py','example.js','example.ts')
+        strict = ('.env','example.yaml','example.yml','example.json','example.ini',
+                  'example.toml','example.md','example.sh')
+        patch_text = ''.join(diff_block(path,[line]) for path in sources + strict)
+        patch_text += 'diff --git a/.env b/pretend.py\n@@ -0,0 +1 @@\n+' + line + '\n'
+        hits = review.scan(self.t,{'改动.diff':patch_text},gitleaks=lambda _:[])
+        self.assertEqual([hit.get('来自') for hit in hits],list(strict)+[None])
+
+    def test_source_call_does_not_hide_another_assignment_on_same_line(self):
+        line = "authorization = load_authorization(password='S3cr3t!x9')"
+        patch_text = diff_block('example.py',[line])
+        hits = review.scan(self.t,{'改动.diff':patch_text},gitleaks=lambda _:[])
+        self.assertEqual([hit['行'] for hit in hits],[5])
+
+    def test_token_scheme_and_prefixed_keys_are_scanned_and_redacted(self):
+        cases = (
+            ('Authorization','Token zxY92aV84bQ76mn5'),
+            ('aws_secret_access_key','aB1cD2eF3gH4iJ5k'),
+            ('DB_PASSWORD','s0m3D8Credential'),
+        )
+        scanner = privacy.CredentialContent()
+        for key,value in cases:
+            with self.subTest(key=key):
+                line = f'{key}: {value}'
+                self.assertTrue(scanner.search(line))
+                self.assertTrue(scanner.search(line,source_code=True))
+                self.assertNotIn(value.split()[-1],privacy.redact_text(line))
+                self.assertEqual(privacy.sanitize({key:value}),{key:privacy.REDACTED})
+
+    def test_notes_and_strict_scanner_still_flag_short_passwords(self):
+        text = "{'password':'x'}"
+        self.assertTrue(privacy.CredentialContent().search(text))
+        self.note.write_text(text)
+        self.assert_refused(lambda _:[],'说明.md')
+
+    def test_empty_quoted_password_is_not_a_secret(self):
+        scanner = privacy.CredentialContent()
+        for text in ('ERP_DB_PASSWORD=""', '"password": ""', "password=''"):
+            with self.subTest(text=text):
+                self.assertFalse(scanner.search(text))
+        for text in ('ERP_DB_PASSWORD="abc12345"', "password='x'"):
+            with self.subTest(text=text):
+                self.assertTrue(scanner.search(text))
 
     def test_db_connection_string_refuses_even_if_gitleaks_misses_it(self):
         (self.repo/'src/db.py').write_text('URL = "'+FAKE_DB+'"\n')
@@ -266,6 +362,106 @@ class ReviewTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(main(['--root',str(self.s.root),'review',str(self.t/'不存在'),'--kind','卡住','--note',str(self.note)]),2)
         self.assertIn('找不到项目',err.getvalue())
+
+
+    def verify_payload(self,verdict='真',**over):
+        evidence=[{'来源':'python -m unittest 的命令输出','级别':'原始输出'},{'来源':'说明里转述的测试结论','级别':'二手转述'}]
+        if verdict=='待确认':evidence=[{'来源':'没有读到命令输出','级别':'无'}]
+        item={'说法':'空列表求和会报错','判词':verdict,'证据及级别':evidence,
+              '四关':{'时间':'命令输出晚于这次改动','对照':'和预期的报错一致','量级':'1 处，数量说得通','矛盾':'没有看到反例'},
+              '改判条件':'若原始输出显示空列表不报错，就改判为假'}
+        item.update(over)
+        return {'条目':[item],'总判词':verdict}
+
+    def codex_candidate(self):
+        return {'kind':'codex','厂商':'OpenAI','经由':'codex exec（只读沙盒）','模型':'codex-readonly',
+                'argv':['/bin/codex-fake','exec','--sandbox','read-only','--skip-git-repo-check','-'],'mode':'plain'}
+
+    def claude_candidate(self):
+        return {'kind':'claude','厂商':'Anthropic','经由':'claude -p（关掉全部工具）','模型':'opus',
+                'argv':['/bin/claude-fake','-p','--tools',''],'mode':'claude_stream'}
+
+    def run_verify(self,runner,writer='claude',candidates=None,now=None):
+        return review.review(self.s,str(self.repo),'核实',str(self.note),writer=writer,base='main',runner=runner,
+                             gitleaks=lambda d:[],candidates=candidates if candidates is not None else [self.codex_candidate()],
+                             now=now or time.time)
+
+    def test_verify_kind_is_readonly_and_archives_under_review(self):
+        before=subprocess.check_output(['git','-C',str(self.repo),'status','--porcelain'])
+        when=time.mktime(time.strptime('2026-11-23 12:30:45','%Y-%m-%d %H:%M:%S'))
+        runner=FakeRunner(json.dumps(self.verify_payload(),ensure_ascii=False))
+        result=self.run_verify(runner,now=lambda:when)
+        after=subprocess.check_output(['git','-C',str(self.repo),'status','--porcelain'])
+        self.assertEqual(before,after)  # 只读：不改项目仓库
+        self.assertEqual(result['结论'],'有回答')
+        self.assertEqual(result['回答']['总判词'],'真')
+        self.assertEqual(result['接收方']['厂商'],'OpenAI')
+        call=runner.calls[0]
+        self.assertEqual(call['cwd_files'],[])
+        self.assertIn('--sandbox',call['argv']);self.assertIn('read-only',call['argv'])
+        self.assertIn('只读',call['text']);self.assertIn('不要改文件',call['text'])
+        target=Path(result['存档'])
+        self.assertEqual(target.parent,self.s.root/'数据/复盘')
+        self.assertEqual(target.name,'20261123-123045-'+self.repo.name+'-核实')
+        self.assertEqual(json.loads((target/'发送记录.json').read_text())['类型'],'核实')
+        self.assertIsNone(review.find_merge_receipt(self.s,str(self.repo)))  # 核实回执不能拿去放行合并
+        outside=[p for p in Path(review.__file__).resolve().parent.glob('*.py') if p.name!='review.py']
+        for path in outside:
+            body=path.read_text(encoding='utf-8')
+            for needle in ('--kind 核实',"kind='核实'",'kind="核实"'):
+                self.assertNotIn(needle,body,path.name)
+
+    def test_verify_prompt_has_eight_requirements(self):
+        text=review.prompt('核实',{'说明.md':'说法：测试全过。\n'})
+        for part in ('把关键说法拆成能数的断言','两个来源','至少一个是原始输出','同一来源的拷贝只算一个',
+                     '过四关','证据晚于改动','和基线','数字合理','有无反例','证据标级','二手转述',
+                     '真、假、一半对、待确认','查不了就写待确认','改判条件','ci check','测到了什么','没测到什么',
+                     '结构化 JSON','说法','判词','证据及级别','总判词'):
+            with self.subTest(part=part):self.assertIn(part,text)
+        self.assertNotIn('把握分',text)
+
+    def test_verify_rejects_verdicts_outside_the_four(self):
+        for verdict in ('真','假','一半对','待确认'):
+            parsed,problem=review.parse_answer(json.dumps(self.verify_payload(verdict),ensure_ascii=False),'核实')
+            self.assertEqual(problem,'',verdict);self.assertEqual(parsed['总判词'],verdict)
+        for bad in ('通过','基本真','也许','完成'):
+            with self.subTest(bad=bad):
+                result=self.run_verify(FakeRunner(json.dumps(self.verify_payload(bad),ensure_ascii=False)))
+                self.assertEqual(result['结论'],'作废');self.assertIn('判词',result['作废原因'])
+                self.assertFalse((Path(result['存档'])/'回答.json').exists())
+        result=self.run_verify(FakeRunner(json.dumps({**self.verify_payload(),'总判词':'大概'},ensure_ascii=False)))
+        self.assertEqual(result['结论'],'作废');self.assertIn('总判词',result['作废原因'])
+        graded=self.verify_payload();graded['条目'][0]['证据及级别'][0]['级别']='实测'
+        result=self.run_verify(FakeRunner(json.dumps(graded,ensure_ascii=False)))
+        self.assertEqual(result['结论'],'作废');self.assertIn('级别',result['作废原因'])
+
+    def test_verify_rejects_same_vendor(self):
+        runner=FakeRunner(json.dumps(self.verify_payload(),ensure_ascii=False))
+        for writer,same in (('claude',self.claude_candidate()),('codex',self.codex_candidate())):
+            with self.subTest(writer=writer):
+                with self.assertRaises(Blocked) as caught:
+                    self.run_verify(runner,writer=writer,candidates=[same])
+                self.assertIn('同厂商',str(caught.exception))
+        self.assertEqual(runner.calls,[])
+        self.assertEqual(self.archives(),[])
+        mixed=FakeRunner(json.dumps(self.verify_payload(),ensure_ascii=False))
+        result=self.run_verify(mixed,writer='claude',candidates=[self.claude_candidate(),self.codex_candidate()])
+        self.assertEqual(result['结论'],'有回答')
+        self.assertEqual([Path(call['argv'][0]).name for call in mixed.calls],['codex-fake'])
+
+    def test_verify_help_lists_kind(self):
+        import argparse
+        parser=review.register(argparse.ArgumentParser().add_subparsers())
+        text=parser.format_help()
+        self.assertIn('卡住|方案|事后|合并|核实',text)
+        self.assertIn('只读',text)
+        self.assertIn('另一家厂商',text)
+        with self.assertRaises(SystemExit) as caught:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                from portable.__main__ import main
+                main(['review','--help'])
+        self.assertEqual(caught.exception.code,0)
+        self.assertIn('--kind',out.getvalue());self.assertIn('核实',out.getvalue())
 
 
 class PrivacyConnectionStringTest(unittest.TestCase):
