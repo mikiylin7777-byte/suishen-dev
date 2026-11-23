@@ -168,6 +168,19 @@ class Product(unittest.TestCase):
         with patch('portable.migration.shutil.disk_usage',return_value=shutil._ntuple_diskusage(10,10,0)):
             with self.assertRaises(Blocked):self.snap()
         self.assertFalse(list(self.media.glob('snapshot-*')))
+    def test_ordinary_snapshot_secret_block_includes_guidance(self):
+        phrases=('这是升级前的安全检查','不要手改数据库','只读方式确认是不是真密钥','测试样例','报总管或用户','脱敏后重试','【密钥】')
+        self.file('.env','name=fixture')
+        with self.assertRaises(Blocked) as caught:self.snap()
+        text=str(caught.exception)
+        self.assertIn('敏感文件不得进入普通快照',text)
+        for phrase in phrases:self.assertIn(phrase,text)
+        (self.src/'.env').unlink()
+        self.file('note.txt','api_key = SYNTHETIC_FIXTURE_ONLY')
+        with self.assertRaises(Blocked) as caught:self.snap()
+        text=str(caught.exception)
+        self.assertIn('疑似秘密内容',text)
+        for phrase in phrases:self.assertIn(phrase,text)
     def test_secret_and_special_git_block(self):
         self.file('.env','SYNTHETIC_ONLY=value')
         with self.assertRaises(Blocked):self.snap()

@@ -20,6 +20,14 @@ from .core import Blocked, VERSION, atomic, canonical, digest, identifier, lock,
 SECRET_NAME = re.compile(r'(^|/)(\.env($|\.(?!(example|sample|template|dist)$))|\.ssh|\.aws|\.config|credentials?($|\.)|secrets?($|\.)|.*\.(pem|key|p12|pfx))',re.I)
 from .privacy import CredentialContent
 SECRET_CONTENT = CredentialContent()
+# 普通快照被秘密拦住时，告诉使用者这是升级前检查，不要去手改数据库。
+SNAPSHOT_SECRET_HINT = ('这是升级前的安全检查，不要手改数据库。'
+    '先用只读方式确认是不是真密钥；'
+    '若是自己写进记录的测试样例，报总管或用户定是否脱敏后重试；'
+    '真密钥按【密钥】规矩处理。')
+
+def _block_ordinary_snapshot(reason):
+    raise Blocked(reason+'。'+SNAPSHOT_SECRET_HINT)
 
 def git(root, *args):
     p=subprocess.run(['git','-C',str(root),*args],capture_output=True)
@@ -107,10 +115,10 @@ def inventory(root):
                     continue
                 raise Blocked('存在活动锁/未知 sidecar：'+rel)
             if SECRET_NAME.search(rel):
-                raise Blocked('敏感文件不得进入普通快照：'+rel)
+                _block_ordinary_snapshot('敏感文件不得进入普通快照：'+rel)
             data=p.read_bytes()
             if rel not in trusted_runtime and (SECRET_CONTENT.search(data) or re.search(rb'https?://[^/\s:@]+:[^/\s@]+@',data)):
-                raise Blocked('疑似秘密内容，普通快照已阻止：'+rel)
+                _block_ordinary_snapshot('疑似秘密内容，普通快照已阻止：'+rel)
             if data.startswith(b'version https://git-lfs.github.com/spec/v1') or '/lfs/' in '/'+rel:
                 raise Blocked('LFS 尚未实现完整独立恢复')
             sqlite=data.startswith(b'SQLite format 3\x00')

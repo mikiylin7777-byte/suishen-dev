@@ -468,6 +468,18 @@ class CiTest(unittest.TestCase):
         r=ci.merge(self.s,'demo',1,confirm=True,risk='高',approval='用户 11-14「合」',api=api,merger=lambda *a:state.update(merged=True))
         self.assertTrue(r['本次合并']);self.assertEqual(self.s.get(ci.LOG)[-1]['用户点头'],'用户 11-14「合」')
 
+    def test_merge_redacts_approval_and_existing_ledger(self):
+        sample="password='abc12345'"
+        self.s.put(ci.LOG,[{'时间':'2026-11-01','用户点头':sample,'风险':'低'}])
+        state={'merged':False}
+        api=FakeApi(lambda:pr(state='closed',merged=True) if state['merged'] else pr(),st('success'))
+        r=ci.merge(self.s,'demo',1,confirm=True,risk='低',approval='用户点头 '+sample,api=api,merger=lambda *a:state.update(merged=True))
+        self.assertTrue(r['本次合并'])
+        text=json.dumps(self.s.get(ci.LOG),ensure_ascii=False)
+        self.assertIn('[凭据已脱敏]',text)
+        self.assertNotIn('abc12345',text)
+        self.assertEqual(len(self.s.get(ci.LOG)),2)
+
     def test_missing_pr_says_so_and_lists_recent(self):
         from portable.remote_publish import DeliveryError
         def api(idn,method,path,payload=None):

@@ -25,13 +25,17 @@
   写代码档不选 Anthropic 家；审查档与写代码的厂商不同，先后只看配置里的首选顺序，
   只在没有包月可用时才用按量，用了同样记账并提示。程序不写死任何一条线路；
   配置里删掉某几行后，用剩下还能用的家。按量型号只允许 deepseek/*。claude-api-active 不进子会话池。
-- 全机名额：查上限与占名额在同一把文件锁里原子完成；占位带任务号和时间；
-  失败或结束 release；派活窗口崩溃的占位按任务号查状态，已结束回收，查不到且超 24 小时也回收。
+- 全机名额：查上限与占名额在同一把文件锁里原子完成；同时看一分钟负载和内存空闲。
+  负载超过 load_max（默认 CPU 核数），或空闲百分比低于 memory_pressure，就排队并写明原因。
+  空闲先读 macOS memory_pressure -Q，读不到再按 vm_stat 的可回收页比例；都读不到就只按数量拦，不报错。
+  占位带任务号和时间；失败或结束 release；派活窗口崩溃的占位按任务号查状态，已结束回收，查不到且超 24 小时也回收。
 - 主会话临时接管只做两件：识别「5 小时额度」报错、记接管台账；改哪个窗口由总管在 T3 里操作。
 """
 import calendar
 import json
+import os
 import re
+import subprocess
 import time
 from pathlib import Path
 
@@ -59,11 +63,14 @@ LIMIT_WORD = re.compile(r'usage limit|限额|额度|limit', re.I)
 TIME_RX = re.compile(r'(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})日?[T ](\d{1,2}):(\d{2})(?::(\d{2}))?')
 
 METERED_NOTE = '这一单走了按量直连 DeepSeek，要花钱；已记台账，请告诉用户一句。'
+METERED_NOTE_UNRECORDED = '这一单走了按量直连 DeepSeek，要花钱；（本次未记账），请告诉用户一句。'
 
 DEFAULT_QUOTA = {
     'gpt_floor_percent': 40,   # GPT 剩余低于这个百分比就挡池（门槛定 40）
     'stale_hours': 6,          # Codex 读数超过几小时没更新算未知
     'machine_max': 20,         # 全机同时派单上限
+    'load_max': os.cpu_count() or 1,  # 一分钟负载超过它就排队；默认按 CPU 核数
+    'memory_pressure': 10,     # 空闲内存低于这个百分比就排队
     'codex_sessions_dir': '',  # 留空按 ~/.codex/sessions
     'codex_pools': [],         # 共用 GPT 周额度的池，读数吃紧时一起挡
     'priority_project': '',    # 排队时优先放行的项目；留空表示不优先。本机要保哪个项目由设置写，不写死
@@ -94,6 +101,12 @@ def check_config(value):
     machine = value.get('machine_max')
     if type(machine) is not int or machine < 1:
         raise Blocked('quota.machine_max 要是不小于 1 的整数（全机同时派单上限）')
+    load_max = value.get('load_max')
+    if isinstance(load_max, bool) or not isinstance(load_max, (int, float)) or load_max <= 0:
+        raise Blocked('quota.load_max 要是大于 0 的数字（一分钟负载超过它就排队）')
+    pressure = value.get('memory_pressure')
+    if type(pressure) is not int or not 0 <= pressure <= 100:
+        raise Blocked('quota.memory_pressure 要是 0 到 100 的整数（空闲内存低于这个百分比就排队）')
     if not isinstance(value.get('codex_sessions_dir'), str):
         raise Blocked('quota.codex_sessions_dir 要是文字路径，可以留空')
     pools = value.get('codex_pools')
@@ -449,6 +462,30 @@ def _billing_rank(entry):
     return 0 if entry.get('billing') == 'subscription' else 1
 
 
+def _entry_model(entry):
+    return str((entry or {}).get('model') or '').strip()
+
+
+def _candidate_entries(config, tier):
+    """这一档会拿来选的行。重、普通含按量出口；别的档同名不放进来。"""
+    entries = list(_tier_entries((config.get('tiers') or {}).get(tier) or {}))
+    if tier in ('重', '普通'):
+        entries.extend(config.get('metered_deepseek') or [])
+    return entries
+
+
+def _prefixed_matches(entries, bare):
+    """bare 名对上的「前缀/名字」行。精确等于 bare 的配置行不算。"""
+    matched = []
+    for entry in entries:
+        model = _entry_model(entry)
+        if not model or model == 'default' or model.endswith('*') or '/' not in model:
+            continue
+        if model.endswith('/' + bare) and model not in matched:
+            matched.append(model)
+    return matched
+
+
 def _stricter_block(current, until):
     """同一池多条记录时，留挡得更久的：待充值/未知压过具体时间，具体时间留更晚的。"""
     if current is None:
@@ -482,10 +519,11 @@ def pick(root, config, tier, writer_vendor='', task='', available=None, now=None
     available = [str(a).strip() for a in (available or []) if str(a).strip()]
     blocks, reading = blocked_pools(root, config, now=now, sessions_dir=sessions_dir)
     tier_config = config.get('tiers', {}).get(tier) or {'preferred': [], 'backup': []}
+    candidates = _candidate_entries(config, tier)
     writer = (writer_vendor or '').strip().lower()
 
     def resolve(entry):
-        model = str(entry.get('model') or '')
+        model = _entry_model(entry)
         if model == 'default':
             return 'default'
         if model.endswith('*'):
@@ -500,6 +538,16 @@ def pick(root, config, tier, writer_vendor='', task='', available=None, now=None
         for name in available:
             if name == model or name.endswith('/' + model):
                 return name
+        for name in available:
+            if '/' in name or not model.endswith('/' + name):
+                continue
+            # 配置行和 --available 写的是同一个名字时，这是精确行，不拿去套别的前缀。
+            if any(_entry_model(other) == name for other in candidates):
+                continue
+            matched = _prefixed_matches(candidates, name)
+            if len({item.split('/', 1)[0] for item in matched}) > 1:
+                raise Blocked('型号 ' + name + ' 有多家同名，请写全前缀（如 ' + '、'.join(matched) + '）')
+            return name
         return None
 
     def usable(entry):
@@ -519,7 +567,7 @@ def pick(root, config, tier, writer_vendor='', task='', available=None, now=None
                   '池': entry.get('pool') or '', '计费': 'metered' if metered else 'subscription',
                   '任务': task or ''}
         if metered:
-            result['提示'] = METERED_NOTE
+            result['提示'] = METERED_NOTE if record else METERED_NOTE_UNRECORDED
         if config.get('codex_pools') and reading.get('状态') != 'ok':
             result['codex读数'] = reading
         if record:
@@ -534,11 +582,10 @@ def pick(root, config, tier, writer_vendor='', task='', available=None, now=None
             return 2 if (writer and vendor == writer) else 0
 
         ordered = sorted(_tier_entries(tier_config), key=lambda e: (rank(e), _billing_rank(e)))
-        usable_entries = [e for e in ordered if usable(e)]
-        # 还有包月就不取按量。选中按量时按 billing 记账并提示。
-        subscription = [e for e in usable_entries if e.get('billing') != 'metered']
-        chosen = subscription[0] if subscription else next(
-            (e for e in usable_entries if e.get('billing') == 'metered'), None)
+        # 还有包月就不取按量。选中就停，后面没被选中的同名不参与歧义。
+        chosen = next((e for e in ordered if e.get('billing') != 'metered' and usable(e)), None)
+        if chosen is None:
+            chosen = next((e for e in ordered if e.get('billing') == 'metered' and usable(e)), None)
         if chosen is None:
             return finish({'状态': '报用户', '档位': tier, '原因': '审查档没有可用的模型（全被挡或没配）', '任务': task or ''})
         result = result_ok(chosen, resolve(chosen), metered=chosen.get('billing') == 'metered')
@@ -553,22 +600,22 @@ def pick(root, config, tier, writer_vendor='', task='', available=None, now=None
             result['提示'] = (result.get('提示') or '') + note
         return finish(result)
 
+    def not_anthropic(entry):
+        return (entry.get('vendor') or '').strip().lower() != 'anthropic'
+
     entries = _tier_entries(tier_config)
-    subscription = [e for e in entries
-                    if usable(e) and (e.get('vendor') or '').strip().lower() != 'anthropic'
-                    and e.get('billing') == 'subscription']
-    if subscription:
-        chosen = subscription[0]
-        return finish(result_ok(chosen, resolve(chosen)))
+    for entry in entries:
+        if not_anthropic(entry) and entry.get('billing') == 'subscription' and usable(entry):
+            return finish(result_ok(entry, resolve(entry)))
     if tier == '轻':
         return finish({'状态': '排队', '档位': tier, '任务': task or '',
                        '原因': '包月全被挡，轻活排队等额度恢复（记进项目 STATUS.md）'})
-    metered = [e for e in entries if usable(e) and (e.get('vendor') or '').strip().lower() != 'anthropic'
-               and e.get('billing') == 'metered']
-    metered.extend(e for e in (config.get('metered_deepseek') or []) if usable(e))
-    if metered:
-        chosen = metered[0]
-        return finish(result_ok(chosen, resolve(chosen), metered=True))
+    for entry in entries:
+        if not_anthropic(entry) and entry.get('billing') == 'metered' and usable(entry):
+            return finish(result_ok(entry, resolve(entry), metered=True))
+    for entry in config.get('metered_deepseek') or []:
+        if usable(entry):
+            return finish(result_ok(entry, resolve(entry), metered=True))
     configured = bool(config.get('metered_deepseek')) or any(e.get('billing') == 'metered' for e in entries)
     if tier == '重':
         reason = ('重活没有可用模型：包月和按量出口都被挡，由用户决定要不要用按量的。' if configured
@@ -599,11 +646,87 @@ def _reclaim(occupied, now, statuses):
     return kept
 
 
-def occupy(root, task, limit, now=None, statuses=None):
-    """查上限与占名额在同一把文件锁里一次做完；派发失败/子会话结束用 release 释放。"""
+_FREE_PERCENT = re.compile(r'free percentage:\s*(\d+(?:\.\d+)?)\s*%', re.I)
+_VM_PAGE = re.compile(
+    r'^Pages (free|active|inactive|speculative|purgeable|throttled|wired down|occupied by compressor):\s+(\d+)',
+    re.I)
+# purgeable 已经算在别的页里，只加进可回收，不加进总页数。
+_VM_TOTAL = ('free', 'active', 'inactive', 'speculative', 'throttled', 'wired down', 'occupied by compressor')
+_VM_AVAILABLE = ('free', 'inactive', 'speculative', 'purgeable')
+
+
+def _command_text(argv):
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+    if result.returncode != 0:
+        return ''
+    return result.stdout or ''
+
+
+def read_load():
+    """一分钟负载。读不到返回 None，调用方只按数量拦。"""
+    try:
+        return float(os.getloadavg()[0])
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def _vm_stat_free_percent(text):
+    """可回收页 / 总页数。对不上 vm_stat 的页分类就返回 None，不拿 free 单独猜。"""
+    pages = {}
+    for line in text.splitlines():
+        match = _VM_PAGE.match(line.strip())
+        if match:
+            pages[match.group(1).lower()] = int(match.group(2))
+    if 'free' not in pages:
+        return None
+    total = sum(pages.get(key, 0) for key in _VM_TOTAL)
+    if not total:
+        return None
+    available = sum(pages.get(key, 0) for key in _VM_AVAILABLE)
+    return 100.0 * available / total
+
+
+def read_memory_free():
+    """空闲内存百分比。先 memory_pressure -Q，不行再看 vm_stat 可回收页。读不到返回 None。"""
+    text = _command_text(['memory_pressure', '-Q'])
+    if text:
+        match = _FREE_PERCENT.search(text)
+        if match:
+            return float(match.group(1))
+    text = _command_text(['vm_stat'])
+    if not text:
+        return None
+    return _vm_stat_free_percent(text)
+
+
+def _plain_number(value):
+    return f'{float(value):.4f}'.rstrip('0').rstrip('.') or '0'
+
+
+def _host_queue(running, reason):
+    return {'占位': False, '状态': '排队', '在跑': len(running), '在跑任务': running, '原因': reason}
+
+
+def occupy(root, task, limit, now=None, statuses=None, *, load=None, memory_free=None,
+           load_max=None, memory_pressure=None):
+    """查上限与占名额在同一把文件锁里一次做完；负载或内存压力超了就排队。
+
+    load / memory_free 留给测试注入。不传就读本机；读不到只按数量拦，不报错。
+    """
     if not str(task or '').strip():
         raise Blocked('占名额要带任务号')
     now = time.time() if now is None else now
+    if load_max is None:
+        load_max = DEFAULT_QUOTA['load_max']
+    if memory_pressure is None:
+        memory_pressure = DEFAULT_QUOTA['memory_pressure']
+    if load is None:
+        load = read_load()
+    if memory_free is None:
+        memory_free = read_memory_free()
     with lock(_ledger_lock(root)):
         ledger = load_ledger(root)
         ledger['占用'] = _reclaim(ledger['占用'], now, statuses)
@@ -612,6 +735,15 @@ def occupy(root, task, limit, now=None, statuses=None):
             _save_ledger(root, ledger)
             return {'占位': False, '在跑': len(ledger['占用']), '在跑任务': running,
                     '原因': '全机同时派单已达上限 ' + str(limit)}
+        if isinstance(load, (int, float)) and not isinstance(load, bool) and load > load_max:
+            _save_ledger(root, ledger)
+            return _host_queue(running, '一分钟负载 ' + _plain_number(load) + ' 超过上限 '
+                                + _plain_number(load_max) + '，排队')
+        if (isinstance(memory_free, (int, float)) and not isinstance(memory_free, bool)
+                and memory_free < memory_pressure):
+            _save_ledger(root, ledger)
+            return _host_queue(running, '内存空闲 ' + _plain_number(memory_free) + '% 低于门槛 '
+                                + _plain_number(memory_pressure) + '%，排队')
         ledger['占用'].append({'任务': str(task).strip(), '时间': now})
         _save_ledger(root, ledger)
         return {'占位': True, '在跑': len(ledger['占用']), '在跑任务': running + [str(task).strip()]}
@@ -747,7 +879,8 @@ def run(args):
         current = config()
         limit = args.limit if args.limit is not None else current['machine_max']
         statuses = json.loads(args.statuses) if args.statuses else None
-        return occupy(root, args.task, limit, statuses=statuses)
+        return occupy(root, args.task, limit, statuses=statuses,
+                      load_max=current['load_max'], memory_pressure=current['memory_pressure'])
     if action == 'release':
         return release(root, args.task)
     if action == 'clear':

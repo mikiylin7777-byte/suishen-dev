@@ -33,6 +33,12 @@ VERDICT_TEXT={
 LOG='ci:merges'
 
 
+def _redact_merges(records):
+    """写入合并台账前，把新记录和已有记录里的凭据字面串都脱敏。"""
+    from .privacy import sanitize
+    return [sanitize(record) if isinstance(record, dict) else record for record in records]
+
+
 def _project(store,name):
     """项目可以写注册表里的 id、名字，或项目目录。"""
     from .board import load
@@ -509,11 +515,12 @@ def merge(store,project,number,confirm=False,wait_first=False,timeout=3600,api=N
         parents = [p.get('sha') for p in merged.get('parents') or []]
         if (after.get('base') or {}).get('ref') != 'main' or parents != [batch['发布目标提交'], sha]:
             raise Blocked('Gitea 已显示发布 PR 已合并，但目标分支或合并父提交与核验时不同。请核查，别重发')
+    from .privacy import redact_text
     record={'时间':time.strftime('%Y-%m-%d %H:%M:%S'),'仓库':idn['repo'],'PR':int(number),'头提交':sha,
             '合并提交':after.get('merge_commit_sha') or after.get('merged_commit_id') or '','检查':[c['名称']+'='+c['结果'] for c in result['检查']],
-            '风险':risk,'用户点头':(approval or '').strip(),'类别':kind,'CI模式':ci_mode}
+            '风险':risk,'用户点头':redact_text((approval or '').strip()),'类别':kind,'CI模式':ci_mode}
     record.update(batch)
-    store.put(LOG,(store.get(LOG,[])+[record])[-200:])
+    store.put(LOG,_redact_merges((store.get(LOG,[])+[record])[-200:]))
     out=dict(result,**{'本次合并':True,'已合并':True,'合并提交':record['合并提交'],'说明':'检查全部通过，已合并并读回确认。','类别':kind,'CI模式':ci_mode})
     out.update(batch)
     if kind=='代码类' and not batch:out['提醒']='记得另开文档 PR 更新 STATUS.md、功能清单.md（见【收工必写】）'

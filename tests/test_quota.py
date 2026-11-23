@@ -40,6 +40,11 @@ class QuotaTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name).resolve()
+        self._read_memory_free = quota.read_memory_free
+        for item in (patch.object(quota, 'read_load', return_value=0.0),
+                     patch.object(quota, 'read_memory_free', return_value=100.0)):
+            item.start()
+            self.addCleanup(item.stop)
 
     # ---------- 入账 ----------
 
@@ -293,6 +298,73 @@ class QuotaTest(unittest.TestCase):
                          ('ok', 'deepseek/deepseek-reasoner', 'metered'))
         self.assertIn('提示', chosen)
 
+    def test_available_bare_name_matches_prefixed_model(self):
+        current = config()
+        current['tiers']['重'] = {'preferred': [
+            {'model': 'cursor/grok-4.7', 'vendor': 'cursor', 'pool': 'cursor', 'billing': 'subscription'}],
+            'backup': []}
+        chosen = quota.pick(self.root, current, '重', now=NOW, available=['grok-4.7'], record=False)
+        self.assertEqual((chosen['状态'], chosen['模型']), ('ok', 'grok-4.7'))
+        current['tiers']['重']['preferred'].append(
+            {'model': 'openai/grok-4.7', 'vendor': 'openai', 'pool': 'openai', 'billing': 'subscription'})
+        with self.assertRaises(Blocked) as caught:
+            quota.pick(self.root, current, '重', now=NOW, available=['grok-4.7'], record=False)
+        self.assertIn('写全前缀', str(caught.exception))
+        chosen = quota.pick(self.root, current, '重', now=NOW, available=['cursor/grok-4.7'], record=False)
+        self.assertEqual((chosen['状态'], chosen['模型']), ('ok', 'cursor/grok-4.7'))
+
+    def test_real_config_shape_exact_available_is_not_ambiguous(self):
+        # 本机档位：重活里有 opencode-go/deepseek-v4-pro，按量是 deepseek/deepseek-v4-pro；
+        # 审查里同时有精确名 claude-sonnet-5-5 和 cursor/claude-sonnet-5-5。
+        def row(model, vendor, pool, billing='subscription'):
+            return {'model': model, 'vendor': vendor, 'pool': pool, 'billing': billing}
+
+        code = {'preferred': [row('gpt-6.2-sol', 'openai', 'codex')],
+                'backup': [row('opencode-go/deepseek-v4-pro', 'deepseek', 'opencode-go'),
+                           row('cursor/grok-4.7', 'xai', 'cursor')]}
+        review = {'preferred': [row('gpt-6.2-sol', 'openai', 'codex'),
+                                row('opencode-go/deepseek-v4-pro', 'deepseek', 'opencode-go'),
+                                row('cursor/grok-4.7', 'xai', 'cursor'),
+                                row('cursor/claude-sonnet-5-5', 'anthropic', 'cursor')],
+                  'backup': [row('claude-sonnet-5-5', 'anthropic', 'claude-subscription')]}
+        current = config(tiers={'重': code, '普通': code, '轻': code, '审查': review},
+                         metered_deepseek=[row('deepseek/deepseek-v4-pro', 'deepseek',
+                                               'deepseek-direct', 'metered')])
+        chosen = quota.pick(self.root, current, '重', now=NOW, record=False,
+                            available=['gpt-6.2-sol', 'deepseek-v4-pro', 'grok-4.7'])
+        self.assertEqual((chosen['状态'], chosen['模型'], chosen['池']), ('ok', 'gpt-6.2-sol', 'codex'))
+        # 轻档不看按量出口，别的档那条同名不拦。
+        light = quota.pick(self.root, current, '轻', now=NOW, record=False, available=['deepseek-v4-pro'])
+        self.assertEqual((light['状态'], light['模型'], light['池']),
+                         ('ok', 'deepseek-v4-pro', 'opencode-go'))
+        reviewed = quota.pick(self.root, current, '审查', now=NOW, record=False,
+                              available=['claude-sonnet-5-5'])
+        self.assertEqual((reviewed['状态'], reviewed['模型'], reviewed['池']),
+                         ('ok', 'claude-sonnet-5-5', 'claude-subscription'))
+        with self.assertRaises(Blocked) as caught:
+            quota.pick(self.root, current, '重', now=NOW, record=False, available=['deepseek-v4-pro'])
+        self.assertIn('写全前缀', str(caught.exception))
+
+    def test_no_record_metered_note_says_not_booked(self):
+        current = config(tiers={
+            '重': tier(['gpt-5']),
+            '普通': tier(['gpt-5']),
+            '轻': tier(['gpt-5']),
+            '审查': tier(['gpt-5']),
+        }, metered_deepseek=[{'model': 'deepseek/*', 'vendor': 'DeepSeek', 'pool': 'deepseek',
+                              'billing': 'metered'}])
+        quota.record_error(self.root, 'OpenAI', 'gpt-5', 'codex', 'rate limit exceeded', now=NOW)
+        chosen = quota.pick(self.root, current, '普通', now=NOW, record=False,
+                            available=['deepseek/deepseek-chat'])
+        self.assertEqual(chosen['计费'], 'metered')
+        self.assertIn('（本次未记账）', chosen['提示'])
+        self.assertNotIn('已记台账', chosen['提示'])
+        self.assertNotIn('按量', [item['类型'] for item in quota.load_ledger(self.root)['records']])
+        booked = quota.pick(self.root, current, '普通', now=NOW, record=True,
+                            available=['deepseek/deepseek-chat'])
+        self.assertIn('已记台账', booked['提示'])
+        self.assertNotIn('（本次未记账）', booked['提示'])
+
     def test_light_queues_and_heavy_reports_when_all_blocked(self):
         current = config(tiers={
             '重': tier(['gpt-5']),
@@ -487,7 +559,7 @@ class QuotaTest(unittest.TestCase):
             '    if time.time() > deadline:\n'
             '        raise SystemExit("barrier timeout")\n'
             '    time.sleep(0.01)\n'
-            'print(json.dumps(occupy(root, task, 3)))\n'
+            'print(json.dumps(occupy(root, task, 3, load=0, memory_free=100)))\n'
         )
         processes = [subprocess.Popen(
             [sys.executable, '-B', '-c', script, str(self.root), f'task-{index}',
@@ -528,6 +600,72 @@ class QuotaTest(unittest.TestCase):
         released = quota.occupy(self.root, 'task-4', 1, now=NOW + 25 * 3600)
         self.assertIs(released['占位'], True)
         self.assertNotIn('task-3', released['在跑任务'])
+
+    def test_occupy_queues_on_injected_load_or_memory(self):
+        ok = quota.occupy(self.root, 'task-ok', 5, now=NOW, load=0.2, memory_free=50,
+                          load_max=2, memory_pressure=10)
+        self.assertIs(ok['占位'], True)
+        loaded = quota.occupy(self.root, 'task-load', 5, now=NOW, load=3, memory_free=50,
+                              load_max=2, memory_pressure=10)
+        self.assertEqual(loaded['状态'], '排队')
+        self.assertIs(loaded['占位'], False)
+        self.assertIn('负载', loaded['原因'])
+        self.assertNotIn('task-load', [item['任务'] for item in quota.load_ledger(self.root)['占用']])
+        tight = quota.occupy(self.root, 'task-mem', 5, now=NOW, load=0.2, memory_free=5,
+                             load_max=2, memory_pressure=10)
+        self.assertEqual(tight['状态'], '排队')
+        self.assertIn('内存', tight['原因'])
+        with patch.object(quota, 'read_load', return_value=None), \
+             patch.object(quota, 'read_memory_free', return_value=None):
+            blind = quota.occupy(self.root, 'task-blind', 5, now=NOW, load_max=1, memory_pressure=99)
+        self.assertIs(blind['占位'], True)
+        bad = config()
+        bad['load_max'] = 0
+        with self.assertRaises(Blocked):
+            quota.check_config(bad)
+        bad = config()
+        bad['memory_pressure'] = 101
+        with self.assertRaises(Blocked):
+            quota.check_config(bad)
+        sample = 'System-wide memory free percentage: 47%\n'
+        with patch('portable.quota.subprocess.run', return_value=SimpleNamespace(returncode=0, stdout=sample)):
+            self.assertEqual(self._read_memory_free(), 47.0)
+        vm = ('Pages free: 25.\nPages active: 25.\nPages inactive: 25.\n'
+              'Pages speculative: 0.\nPages wired down: 25.\nPages occupied by compressor: 0.\n')
+
+        def run(argv, **kwargs):
+            if argv[0] == 'memory_pressure':
+                raise OSError('missing')
+            return SimpleNamespace(returncode=0, stdout=vm)
+
+        with patch('portable.quota.subprocess.run', side_effect=run):
+            self.assertEqual(self._read_memory_free(), 50.0)
+        with patch('portable.quota.subprocess.run', side_effect=OSError('missing')):
+            self.assertIsNone(self._read_memory_free())
+
+    def test_vm_stat_reclaimable_pages_stay_with_memory_pressure(self):
+        # 真实 vm_stat：free 很小、inactive 很大。只拿 free 不到 1%，和 memory_pressure -Q（约 46%）不是一个量级。
+        vm = ('Mach Virtual Memory Statistics: (page size of 16384 bytes)\n'
+              'Pages free:                                     6631.\n'
+              'Pages active:                                 351357.\n'
+              'Pages inactive:                               352170.\n'
+              'Pages speculative:                              1155.\n'
+              'Pages throttled:                                   0.\n'
+              'Pages wired down:                             219556.\n'
+              'Pages purgeable:                               19131.\n'
+              'Pages occupied by compressor:                 588009.\n')
+
+        def run(argv, **kwargs):
+            if argv[0] == 'memory_pressure':
+                raise OSError('missing')
+            return SimpleNamespace(returncode=0, stdout=vm)
+
+        with patch('portable.quota.subprocess.run', side_effect=run):
+            free = self._read_memory_free()
+        total = 6631 + 351357 + 352170 + 1155 + 219556 + 588009
+        reclaimable = 6631 + 352170 + 1155 + 19131
+        self.assertGreaterEqual(free, 10.0)
+        self.assertAlmostEqual(free, 100.0 * reclaimable / total)
 
     # ---------- 主会话接管（3.5） ----------
 
@@ -657,6 +795,8 @@ class QuotaTest(unittest.TestCase):
         stored = json.loads(json.dumps(quota.DEFAULT_QUOTA))
         del stored['stale_hours']
         del stored['priority_project']
+        del stored['load_max']
+        del stored['memory_pressure']
         path = settings.path(store)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({'owner_name': '旧', 'quota': stored}, ensure_ascii=False),
@@ -664,6 +804,8 @@ class QuotaTest(unittest.TestCase):
         loaded = settings.load(store)
         self.assertEqual(loaded['quota']['stale_hours'], 6)
         self.assertEqual(loaded['quota']['priority_project'], '')
+        self.assertEqual(loaded['quota']['load_max'], quota.DEFAULT_QUOTA['load_max'])
+        self.assertEqual(loaded['quota']['memory_pressure'], quota.DEFAULT_QUOTA['memory_pressure'])
         saved = settings.set_value(store, 'owner_name', '改过')
         self.assertEqual(saved['owner_name'], '改过')
         self.assertEqual(saved['quota']['stale_hours'], 6)
@@ -696,6 +838,27 @@ class QuotaTest(unittest.TestCase):
         self.assertIn('简报一行', shown)
         self.assertIn('被挡的池', shown)
         self.assertEqual(shown['被挡的池'], {})
+
+    def test_cli_pick_no_record_says_not_booked(self):
+        store = SimpleNamespace(root=self.root)
+        settings.save(store, {'quota': config(tiers={
+            '重': tier(['gpt-5']),
+            '普通': tier(['gpt-5']),
+            '轻': tier(['gpt-5']),
+            '审查': tier(['gpt-5']),
+        }, metered_deepseek=[{'model': 'deepseek/*', 'vendor': 'DeepSeek', 'pool': 'deepseek',
+                              'billing': 'metered'}])})
+        quota.record_error(self.root, 'OpenAI', 'gpt-5', 'codex', 'rate limit exceeded', now=NOW)
+        env = {**os.environ, 'PORTABLE_HOME': str(self.root / 'fake-home'),
+               'PYTHONDONTWRITEBYTECODE': '1'}
+        result = subprocess.run([sys.executable, '-B', '-m', 'portable', '--root', str(self.root),
+                                 'quota', 'pick', '--tier', '普通', '--no-record',
+                                 '--available', 'deepseek/deepseek-chat'],
+                                cwd=SOURCE, capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        chosen = json.loads(result.stdout)
+        self.assertIn('（本次未记账）', chosen['提示'])
+        self.assertNotIn('已记台账', chosen['提示'])
 
 
 if __name__ == '__main__':
