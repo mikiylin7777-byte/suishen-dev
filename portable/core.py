@@ -163,6 +163,69 @@ class Database:
     def close(self):
         if self.depth:raise Blocked('不能关闭活动事务')
 
+class _Readonly:
+    """只读查看连接。私有副本用完后连同临时目录一起收掉。"""
+    def __init__(self, connection, cleanup=None):
+        self._connection=connection
+        self._cleanup=cleanup
+    def execute(self, *args):
+        return self._connection.execute(*args)
+    def close(self):
+        try:self._connection.close()
+        finally:
+            cleanup,self._cleanup=self._cleanup,None
+            if cleanup:cleanup()
+
+def _open_uri(path, query):
+    # sqlite3.connect 往往要到第一条语句才真正打开文件。
+    connection=sqlite3.connect(path.as_uri()+'?'+query,uri=True)
+    try:connection.execute('SELECT 1 FROM sqlite_master LIMIT 1')
+    except BaseException:
+        connection.close();raise
+    return connection
+
+def connect_readonly(path):
+    """只读查看已有 SQLite，不把真实用户库打开成可写。
+
+    macOS 自带 Python 3.9 的 SQLite 对「已经检查点、但没有 -shm」的 WAL 库，
+    mode=ro 会报 unable to open database file：只读连接不能在旁边新建 -shm。
+    没有 -shm 表示没有活着的连接；-wal 不存在或为空表示没有未合并帧。
+    只有这时才用 immutable=1，读的是主库里已经落盘的内容。
+    -wal 里还有帧时改读私有副本（副本可以自建 -shm），避免 immutable 把这些帧丢掉，
+    也不改用户库旁边的文件。
+    """
+    path=Path(path)
+    try:
+        return _open_uri(path,'mode=ro')
+    except sqlite3.OperationalError as exc:
+        if 'unable to open database file' not in str(exc).lower():raise
+        return _connect_wal_without_shm(path,exc)
+
+def _connect_wal_without_shm(path, original):
+    if path.is_symlink():raise original
+    try:
+        with path.open('rb') as handle:header=handle.read(20)
+    except OSError:raise original from None
+    if len(header)<20 or header[:16]!=b'SQLite format 3\x00' or header[18]!=2:raise original
+    wal,shm=Path(str(path)+'-wal'),Path(str(path)+'-shm')
+    if wal.is_symlink() or shm.is_symlink() or shm.exists() or (wal.exists() and not wal.is_file()):raise original
+    if wal.is_file() and wal.stat().st_size:return _connect_private_wal_copy(path,wal)
+    return _open_uri(path,'mode=ro&immutable=1')
+
+def _connect_private_wal_copy(path, wal):
+    temp=tempfile.TemporaryDirectory(prefix='portable-ro-')
+    connection=None
+    try:
+        dest=Path(temp.name)/path.name
+        shutil.copyfile(path,dest)
+        shutil.copyfile(wal,Path(str(dest)+'-wal'))
+        connection=sqlite3.connect(dest)
+        connection.execute('SELECT 1 FROM sqlite_master LIMIT 1')
+    except BaseException:
+        if connection is not None:connection.close()
+        temp.cleanup();raise
+    return _Readonly(connection,temp.cleanup)
+
 class Store:
     @cooperative
     def __init__(self, root):
@@ -174,7 +237,7 @@ class Store:
             safe(self.root,managed)
         self.dbpath = self.root / '数据' / 'state.sqlite'
         if self.dbpath.exists():
-            check = sqlite3.connect(self.dbpath.as_uri()+'?mode=ro',uri=True)
+            check = connect_readonly(self.dbpath)
             try:
                 row=check.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
                 if not row or row[0]!='1':raise Blocked('未知数据库或不兼容版本，未初始化覆盖')

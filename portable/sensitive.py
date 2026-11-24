@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tarfile
@@ -93,6 +94,126 @@ def pack(source,target,choice='cancel',recipient=None):
     return value
 
 
+def _uses_data_filter(stream):
+    return 'filter' in getattr(stream.extractall, '__code__').co_varnames
+
+def _destination_stack(name):
+    """成员路径必须落在目标目录内。绝对路径、以及 .. 走出目标，都拒绝。
+
+    包内的 a/b/../c 先折成 a/c，和 data filter 一样可以留下。
+    """
+    if not name or '\x00' in name or os.path.isabs(name):return None
+    raw=name.replace('\\','/')
+    if raw.startswith('/'):return None
+    stack=[]
+    for part in raw.split('/'):
+        if part in ('','.'):continue
+        if part=='..':
+            if not stack:return None
+            stack.pop()
+        else:stack.append(part)
+    return stack or None
+
+def _link_target_inside(member_stack, linkname):
+    """相对符号链接的解析结果必须仍在目标目录内，和 data filter 对 symlink 的要求一致。"""
+    if not linkname or '\x00' in linkname or os.path.isabs(linkname):return False
+    raw=linkname.replace('\\','/')
+    if raw.startswith('/'):return False
+    stack=list(member_stack[:-1])
+    parts=[part for part in raw.split('/') if part not in ('','.')]
+    if not parts:return False
+    for part in parts:
+        if part=='..':
+            if not stack:return False
+            stack.pop()
+        else:stack.append(part)
+    return bool(stack)
+
+def _resolved_link_inside(root, path):
+    """realpath 会顺着链接链走，文字折叠看不到的逃逸在这里露出来。"""
+    boundary=os.path.realpath(root)
+    try:target=os.path.realpath(path)
+    except OSError:return False
+    try:return os.path.commonpath([boundary, target])==boundary
+    except ValueError:return False
+
+def _reject_escaped_links(root):
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in dirnames+filenames:
+            path=os.path.join(dirpath, name)
+            if os.path.islink(path) and not _resolved_link_inside(root, path):
+                raise Blocked('敏感包含链接或特殊文件：'+os.path.relpath(path, root))
+
+def _walk(root, stack, member_name):
+    current=root
+    for part in stack[:-1]:
+        current=current/part
+        if current.is_symlink():raise Blocked('敏感包路径越界：'+member_name)
+        current.mkdir(exist_ok=True)
+    return current/stack[-1]
+
+def _extract_data_legacy(stream, dest):
+    """Python 3.9 没有 data filter。允许包内相对符号链接，其余危险成员照旧拒绝。"""
+    root=Path(dest).resolve()
+    for member in stream.getmembers():
+        stack=_destination_stack(member.name)
+        if stack is None:raise Blocked('敏感包路径越界：'+member.name)
+        if member.issym():
+            if not _link_target_inside(stack, member.linkname or ''):
+                raise Blocked('敏感包含链接或特殊文件：'+member.name)
+            final=_walk(root, stack, member.name)
+            if final.is_symlink() or final.exists():raise Blocked('敏感包路径冲突：'+member.name)
+            os.symlink(member.linkname.replace('\\','/'), final)
+            continue
+        if member.islnk() or not (member.isfile() or member.isdir()):
+            raise Blocked('敏感包含链接或特殊文件：'+member.name)
+        if member.isdir():
+            current=root
+            for part in stack:
+                current=current/part
+                if current.is_symlink():raise Blocked('敏感包路径越界：'+member.name)
+                current.mkdir(exist_ok=True)
+            continue
+        final=_walk(root, stack, member.name)
+        if final.is_symlink() or final.exists():raise Blocked('敏感包路径冲突：'+member.name)
+        source=stream.extractfile(member)
+        if source is None:raise Blocked('敏感包文件不可读：'+member.name)
+        data=source.read()
+        flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL
+        if hasattr(os,'O_NOFOLLOW'):flags|=os.O_NOFOLLOW
+        fd=os.open(final,flags,0o600)
+        try:os.write(fd,data)
+        finally:os.close(fd)
+        mode=stat.S_IMODE(member.mode or 0)&0o755
+        if not mode&0o100:mode&=~0o111
+        os.chmod(final,mode|0o600)
+    try:_reject_escaped_links(root)
+    except Blocked:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+
+def _data_filter(member,dest_path):
+    """官方 data filter 先做安全检查。3.12.3 接受 a/b/../c 但不改名，随后 os.makedirs('a/b/..') 会 FileExistsError。名字里还留着 .. 时折进目标目录，和较新版本的 normpath 一样。"""
+    filtered=tarfile.data_filter(member,dest_path)
+    if filtered is None:return None
+    raw=filtered.name.replace('\\','/')
+    if '..' not in raw.split('/'):return filtered
+    stack=_destination_stack(filtered.name)
+    if stack is None:raise tarfile.OutsideDestinationError(filtered,filtered.name)
+    folded='/'.join(stack)
+    if folded==raw.rstrip('/'):return filtered
+    return filtered.replace(name=folded,deep=False)
+
+def _extract_data(stream, dest):
+    """Unpack like tarfile's data filter. Python 3.9 has no filter argument."""
+    dest=Path(dest);dest.mkdir(mode=0o700,exist_ok=True)
+    if _uses_data_filter(stream):
+        try:stream.extractall(dest,filter=_data_filter)
+        except tarfile.FilterError as exc:raise Blocked('敏感包不能按普通数据解开：'+str(exc)) from None
+        return
+    _extract_data_legacy(stream, dest)
+
+
 def unpack(package,target,identity=None):
     package=Path(package);value=json.loads((package/'manifest.json').read_text());target=Path(target).absolute()
     if target.exists() or target.is_symlink() or any(p.is_symlink() for p in target.parents):raise Blocked('解锁目标必须为全新非链接目录')
@@ -114,7 +235,7 @@ def unpack(package,target,identity=None):
             result=subprocess.run(argv,stderr=subprocess.DEVNULL if identity else None)
             if result.returncode:raise Blocked('age解锁失败，原包保留')
             archive.chmod(0o600)
-            with tarfile.open(archive) as stream:stream.extractall(stage/'unpacked',filter='data')
+            with tarfile.open(archive) as stream:_extract_data(stream,stage/'unpacked')
             os.rename(stage/'unpacked/payload',target)
     from .runtime_identity import reset_restored_tree
     reset_restored_tree(target)

@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -48,6 +49,19 @@ class SDKCacheTests(unittest.TestCase):
         with patch.dict(os.environ, {"PORTABLE_TEST_CACHE_DIR": "cache"}):
             with self.assertRaisesRegex(SystemExit, "absolute"):
                 sdk_cache.sdk_cache_dir()
+
+    def test_old_suite_python_builds_the_sdk_venv_with_python_310(self):
+        def fake_run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0 if "python3.12" in argv[0] else 1)
+        with patch.object(sdk_cache.shutil, "which", side_effect=lambda name: "/fixture/python3.12" if name == "python3.12" else None), \
+             patch.object(sdk_cache.subprocess, "run", side_effect=fake_run), \
+             patch.object(sdk_cache.os.path, "isfile", return_value=False):
+            self.assertEqual(sdk_cache.sdk_python_for_lock("/usr/bin/python3"), "/fixture/python3.12")
+
+    def test_capable_suite_python_builds_its_own_sdk_venv(self):
+        with patch.object(sdk_cache.subprocess, "run", return_value=subprocess.CompletedProcess(["python"], 0)) as run:
+            self.assertEqual(sdk_cache.sdk_python_for_lock("/opt/homebrew/bin/python3"), "/opt/homebrew/bin/python3")
+            self.assertEqual(run.call_count, 1)
 
     def test_symlink_into_checkout_is_rejected(self):
         self.cache.symlink_to(self.checkout, target_is_directory=True)

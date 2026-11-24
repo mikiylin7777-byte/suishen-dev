@@ -238,10 +238,20 @@ def snapshot(store, source, media_path, project='fixture', fail_after=None):
                     b=sqlite3.connect(dest)
                     try:
                         a.backup(b)
+                        # macOS 自带的旧 SQLite 会把目标留在 WAL，并在关闭后留下 -shm。
+                        # 快照只能收清单里的那一个库文件，所以先收成独立的 DELETE 库，再删残留。
+                        if b.execute('PRAGMA journal_mode=DELETE').fetchone()[0]!='delete':
+                            raise Blocked('SQLite 备份未转为独立快照')
                         if b.execute('PRAGMA integrity_check').fetchone()[0]!='ok':
                             raise Blocked('SQLite 一致性备份失败')
                     finally:
                         b.close(); a.close()
+                    for suffix in ('-wal','-shm','-journal'):
+                        sidecar=Path(str(dest)+suffix)
+                        if sidecar.is_symlink() or (sidecar.exists() and not sidecar.is_file()):
+                            raise Blocked('SQLite 备份残留不是普通文件：'+sidecar.name)
+                        if sidecar.exists():
+                            sidecar.unlink()
                 else:
                     atomic(dest,src.read_bytes())
                 os.chmod(dest,meta['mode'])

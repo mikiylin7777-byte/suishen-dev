@@ -11,7 +11,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
-from portable.core import Blocked, Store, atomic, canonical, digest, safe
+from portable.core import Blocked, Store, atomic, canonical, connect_readonly, digest, safe
 from portable import migration as m
 from portable.bots import event,notification,private_config
 from portable.distribution import build,backup,update,material_move,release_verify
@@ -276,6 +276,55 @@ class Product(unittest.TestCase):
             self.assertEqual(rs.db.execute('SELECT path FROM paths WHERE device=?',(rs.device,)).fetchone()[0],str(restored/'代码/demo'))
             with self.assertRaises(Blocked):rs.queue('implement',self.mvp())
         finally:rs.db.close()
+    def test_store_opens_checkpointed_wal_without_shm(self):
+        # Python 3.9 cannot mode=ro a checkpointed WAL database once -shm is gone.
+        root=self.s.root
+        self.s.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        db=self.s.dbpath
+        self.s.db.close()
+        class _Quiet:
+            class db:
+                @staticmethod
+                def close():
+                    return None
+        self.s=_Quiet()
+        for suffix in ('-wal','-shm'):
+            sidecar=Path(str(db)+suffix)
+            if sidecar.is_file() and not sidecar.is_symlink():sidecar.unlink()
+        self.assertFalse(Path(str(db)+'-shm').exists())
+        self.assertEqual(db.read_bytes()[18],2)
+        before=db.read_bytes()
+        check=connect_readonly(db)
+        try:self.assertEqual(check.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0],'1')
+        finally:check.close()
+        if sys.version_info<(3,10):self.assertFalse(Path(str(db)+'-shm').exists())
+        self.s=Store(root)
+        self.assertEqual(self.s.get('schema'),'1')
+        self.assertEqual(db.read_bytes()[:16],before[:16])
+    def test_readonly_open_keeps_uncheckpointed_wal_and_does_not_write_user_db(self):
+        src=self.t/'live.sqlite'
+        held=sqlite3.connect(src)
+        held.execute('PRAGMA journal_mode=WAL')
+        held.execute('PRAGMA wal_autocheckpoint=0')
+        held.execute('CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)')
+        held.execute("INSERT INTO meta VALUES ('schema','1')")
+        held.commit()
+        held.execute("INSERT INTO meta VALUES ('extra','pending')")
+        held.commit()
+        folder=self.t/'quiescent';folder.mkdir()
+        db=folder/'state.sqlite'
+        shutil.copyfile(src,db)
+        shutil.copyfile(Path(str(src)+'-wal'),Path(str(db)+'-wal'))
+        held.close()
+        before=db.read_bytes()
+        wal_before=Path(str(db)+'-wal').read_bytes()
+        self.assertFalse(Path(str(db)+'-shm').exists())
+        check=connect_readonly(db)
+        try:
+            self.assertEqual(check.execute("SELECT value FROM meta WHERE key='extra'").fetchone()[0],'pending')
+        finally:check.close()
+        self.assertEqual(db.read_bytes(),before)
+        self.assertEqual(Path(str(db)+'-wal').read_bytes(),wal_before)
     def test_copied_directory_changes_identity_and_disables_execution(self):
         self.activate();self.s.put('team_config',{'caller':'portable:old'})
         self.s.db.execute('PRAGMA wal_checkpoint(FULL)')
@@ -407,7 +456,12 @@ class Product(unittest.TestCase):
         import py_compile
         subprocess.run(['git','init','-q',str(self.src)],check=True)
         self.file('.gitignore','__pycache__/\n');p=self.file('module.py','print(1)')
-        py_compile.compile(str(p),doraise=True)
+        # macOS 自带的 python3 把字节码写到 ~/Library/Caches，不会出现在仓库里。
+        # 分类看的是仓库内被 git 忽略的 .pyc，所以测试把文件直接写进 __pycache__。
+        pyc=self.src/'__pycache__'/f'module.{sys.implementation.cache_tag}.pyc'
+        pyc.parent.mkdir()
+        py_compile.compile(str(p),cfile=str(pyc),doraise=True)
+        self.assertEqual(pyc.resolve().parent.parent,self.src.resolve())
         snap=self.snap();manifest=m.verify(snap)
         self.assertTrue(manifest['excluded_derived'])
         self.assertFalse(any(k.endswith('.pyc') for k in manifest['files']))

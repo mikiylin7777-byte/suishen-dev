@@ -413,11 +413,14 @@ def _run_streaming(cmd, cwd, *, add_test_directory=False, stage_file=None):
         paths = (str(cwd / 'tests'), env.get('PYTHONPATH'))
         env['PYTHONPATH'] = os.pathsep.join(path for path in paths if path)
     captured = []
-    with subprocess.Popen(cmd, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
-        for line in proc.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            captured.append(line)
+    # 父进程已经占着全机锁。套件里再申请同一路径会一直等到超时，所以套件进程用自己的锁文件。
+    with tempfile.TemporaryDirectory(prefix='portable-suite-lock-') as directory:
+        env['PORTABLE_TEST_LOCK'] = str(Path(directory).resolve() / 'suite.lock')
+        with subprocess.Popen(cmd, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                captured.append(line)
     return proc.returncode, ''.join(captured)
 
 

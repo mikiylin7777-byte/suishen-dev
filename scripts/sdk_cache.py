@@ -84,13 +84,56 @@ def install_sdk(python, lockfile, wheelhouse, sdk):
         raise
 
 
+def _python_at_least(python, version):
+    try:
+        result = subprocess.run(
+            [python, "-I", "-B", "-c",
+             "import sys; raise SystemExit(0 if sys.version_info >= %r else 1)" % (version,)],
+            capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def sdk_python_for_lock(preferred):
+    """Current MCP SDK pins do not install on Python 3.9.
+
+    The suite interpreter still runs the product tests. Only the separate
+    integration venv is moved to a Python that can install the lockfile.
+    """
+    preferred = str(preferred)
+    if _python_at_least(preferred, (3, 10)):
+        return preferred
+    found = []
+    for name in ("python3.14", "python3.13", "python3.12", "python3.11", "python3.10"):
+        path = shutil.which(name)
+        if path:
+            found.append(path)
+    homebrew = "/opt/homebrew/bin/python3"
+    if os.path.isfile(homebrew):
+        found.append(homebrew)
+    seen = set()
+    for path in found:
+        key = os.path.realpath(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _python_at_least(path, (3, 10)):
+            return path
+    raise SystemExit("MCP SDK lockfile needs Python 3.10+; %s cannot install it, and no newer interpreter was found" % preferred)
+
+
 def prepare_sdk(cache):
     cache.mkdir(parents=True, exist_ok=True)
     lockfile = Path(__file__).with_name("mcp-sdk.lock.txt")
     sdk = cache / "integration-sdk"
     sdk_python = sdk / "bin/python"
     wheelhouse = cache / "integration-wheelhouse"
-    python = test_python()
+    suite = test_python()
+    python = sdk_python_for_lock(suite)
+    if python != suite:
+        print("集成 SDK 用 %s 建环境（%s 装不上当前锁文件）；套件测试仍用套件解释器" % (python, suite), file=sys.stderr)
     with (cache / ".prepare.lock").open("a") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         if sdk_python.is_file() and subprocess.run(

@@ -239,10 +239,25 @@ class CodeGates0257Test(unittest.TestCase):
             return 0, 'OK\n'
 
         with self.assertRaisesRegex(Blocked, '已有更新的测试结果'):
-            test_gate.verify_entry(self.repo, store_root=self.t / 'root', runner=finish_after_new_full_failure)
+            test_gate.verify_entry(self.repo, store_root=self.t / 'root', runner=finish_after_new_full_failure,
+                                   lock_path=self.t / 'partial.lock')
         state = self.s.get(test_gate.STATE_PREFIX + 'demo')
         self.assertFalse(state['passed'])
         self.assertEqual((state['failed_tests'], state['full_runs']), (['tests.test_new'], 2))
+
+    def test_suite_process_does_not_take_the_machine_lock(self):
+        code = (
+            'import os, sys\n'
+            'from pathlib import Path\n'
+            'from portable.test_gate import DEFAULT_LOCK, FullTestLock\n'
+            'private=os.environ.get("PORTABLE_TEST_LOCK")\n'
+            'if not private or Path(private).resolve()==Path(DEFAULT_LOCK).resolve():\n'
+            '    sys.exit(4)\n'
+            'with FullTestLock(wait=False):\n'
+            '    pass\n'
+        )
+        rc, out = test_gate._run_streaming([sys.executable, '-c', code], Path(__file__).resolve().parents[1])
+        self.assertEqual(rc, 0, out)
 
     def test_verify_entry_reruns_real_unittest_discovery_failure(self):
         self._use_local_remote()

@@ -55,4 +55,8 @@ run_stage bots node --test adapters/bots/test.mjs
 # Official optional bot dependencies must be installed from the checked-in lockfile for this check.
 run_stage bot-sdk node --test adapters/bots/sdk-smoke.mjs
 
-run_stage capabilities python3 scripts/verify_capabilities.py
+if [ -n "${CI:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ]; then
+  run_stage capabilities python3 scripts/verify_capabilities.py --skip-client-checks
+else
+  run_stage capabilities python3 scripts/verify_capabilities.py
+fi

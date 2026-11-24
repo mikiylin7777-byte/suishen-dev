@@ -154,6 +154,110 @@ class SensitiveTransport(unittest.TestCase):
             sensitive.pack(repo,root/'encrypted','encrypted',public);sensitive.unpack(root/'encrypted',root/'unlocked',identity)
             self.assertIn(b'SYNTHETIC_ONLY_99999',(root/'unlocked/settings.json').read_bytes());history=git(root/'unlocked','log','--format=%H').stdout.splitlines()[-1].decode()
             self.assertIn(b'SYNTHETIC_ONLY_12345',git(root/'unlocked','show',history+':config.json').stdout)
+    def test_data_extract_rejects_parent_paths(self):
+        import tarfile
+        from portable import sensitive
+        def archive(members):
+            buf=io.BytesIO()
+            with tarfile.open(fileobj=buf,mode='w') as stream:
+                for name,body in members:
+                    raw=body.encode();info=tarfile.TarInfo(name);info.size=len(raw);info.type=tarfile.REGTYPE
+                    stream.addfile(info,io.BytesIO(raw))
+            buf.seek(0)
+            return tarfile.open(fileobj=buf,mode='r')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve()
+            with archive([('payload/a.txt','ok')]) as stream:
+                sensitive._extract_data(stream,root/'ok')
+            self.assertEqual((root/'ok/payload/a.txt').read_text(),'ok')
+            with archive([('../escape.txt','no')]) as stream:
+                with self.assertRaises(Blocked):sensitive._extract_data(stream,root/'bad')
+    def test_legacy_extract_allows_inside_relative_links_only(self):
+        # 3.10+ 也直接走回退实现，不靠官方 data filter 替这段代码过关。
+        import stat
+        import tarfile
+        from portable import sensitive
+        def file_info(name, body, mode=0o644):
+            info=tarfile.TarInfo(name);info.size=len(body);info.mode=mode;info.type=tarfile.REGTYPE
+            return info, body
+        def link_info(name, target):
+            info=tarfile.TarInfo(name);info.type=tarfile.SYMTYPE;info.linkname=target
+            return info, b''
+        def hard_info(name, target):
+            info=tarfile.TarInfo(name);info.type=tarfile.LNKTYPE;info.linkname=target
+            return info, b''
+        def dev_info(name):
+            info=tarfile.TarInfo(name);info.type=tarfile.CHRTYPE;info.devmajor=1;info.devminor=3
+            return info, b''
+        def open_archive(items):
+            buf=io.BytesIO()
+            with tarfile.open(fileobj=buf,mode='w') as stream:
+                for info, body in items:
+                    stream.addfile(info, io.BytesIO(body) if info.isreg() else None)
+            buf.seek(0)
+            return tarfile.open(fileobj=buf,mode='r')
+        # payload/sub/../b.txt 只放进 legacy 和产品解包断言。官方 data filter 对这种名字各版本不同：3.12.3 不改名，建父目录时 FileExistsError；较新版本会先 normpath。对照包不含它。
+        folded=file_info('payload/sub/../b.txt', b'folded')
+        safe_items=[
+            file_info('payload/a.txt', b'inside'),
+            file_info('payload/dir/note.txt', b'note'),
+            link_info('payload/dir/up', '../a.txt'),
+            link_info('payload/dir/rel', 'note.txt'),
+            file_info('payload/setuid.bin', b'x', 0o4755),
+            file_info('c', b'chained'),
+            link_info('b', 'c'),
+            link_info('a', 'b'),
+        ]
+        legacy_items=safe_items[:4]+[folded]+safe_items[4:]
+        rejected=[
+            [file_info('/tmp/abs.txt', b'no')],
+            [file_info('../escape.txt', b'no')],
+            [file_info('payload/a.txt', b'ok'), link_info('payload/abs', '/etc/passwd')],
+            [file_info('payload/a.txt', b'ok'), link_info('payload/out', '../../outside')],
+            [file_info('payload/dir/a.txt', b'ok'), link_info('payload/dir/out', '../../../outside')],
+            [file_info('payload/a.txt', b'ok'), hard_info('payload/hard', 'payload/a.txt')],
+            [dev_info('payload/dev')],
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve()
+            dest=root/'legacy';dest.mkdir()
+            with open_archive(legacy_items) as stream:sensitive._extract_data_legacy(stream, dest)
+            self.assertEqual((dest/'payload/a.txt').read_bytes(), b'inside')
+            self.assertEqual(os.readlink(dest/'payload/dir/up'), '../a.txt')
+            self.assertEqual((dest/'payload/dir/up').read_bytes(), b'inside')
+            self.assertEqual(os.readlink(dest/'payload/dir/rel'), 'note.txt')
+            self.assertEqual((dest/'payload/dir/rel').read_bytes(), b'note')
+            self.assertEqual((dest/'payload/b.txt').read_bytes(), b'folded')
+            mode=stat.S_IMODE((dest/'payload/setuid.bin').stat().st_mode)
+            self.assertEqual(mode & 0o4000, 0)
+            self.assertEqual(mode, 0o755)
+            self.assertEqual(os.readlink(dest/'a'), 'b')
+            self.assertEqual(os.readlink(dest/'b'), 'c')
+            self.assertEqual((dest/'a').read_bytes(), b'chained')
+            self.assertEqual((dest/'b').read_bytes(), b'chained')
+            for index, items in enumerate(rejected):
+                with self.subTest(index=index, names=[info.name for info,_ in items]):
+                    bad=root/('bad'+str(index));bad.mkdir()
+                    with open_archive(items) as stream:
+                        with self.assertRaises(Blocked):sensitive._extract_data_legacy(stream, bad)
+            escaped=root/'escaped';escaped.mkdir()
+            with open_archive([link_info('p/q/d', '../../t'), link_info('p/q/e', 'd/../../../x')]) as stream:
+                with self.assertRaises(Blocked):sensitive._extract_data_legacy(stream, escaped)
+            self.assertFalse(escaped.exists())
+            self.assertFalse((escaped/'p'/'q'/'e').is_symlink())
+            folded_dest=root/'folded';folded_dest.mkdir()
+            with open_archive([file_info('payload/keep.txt', b'keep'), folded]) as stream:sensitive._extract_data(stream, folded_dest)
+            self.assertEqual((folded_dest/'payload/b.txt').read_bytes(), b'folded')
+            self.assertEqual((folded_dest/'payload/keep.txt').read_bytes(), b'keep')
+            if 'filter' in tarfile.TarFile.extractall.__code__.co_varnames:
+                with open_archive(safe_items) as stream:sensitive._extract_data(stream, root/'official')
+                self.assertEqual(os.readlink(root/'official/payload/dir/up'), '../a.txt')
+                self.assertEqual((root/'official/payload/dir/up').read_bytes(), b'inside')
+                self.assertEqual(stat.S_IMODE((root/'official/payload/setuid.bin').stat().st_mode) & 0o4000, 0)
+                for index in (1, 2, 3, 4, 6):
+                    with self.subTest(official=index):
+                        with open_archive(rejected[index]) as stream:
+                            with self.assertRaises(Blocked):sensitive._extract_data(stream, root/('official-bad'+str(index)))
 
 class PlannerRecovery(unittest.TestCase):
     def test_connection_failure_does_not_consume_failure_rounds_or_duplicate_create(self):
